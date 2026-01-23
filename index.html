@@ -1,968 +1,646 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>診断データ解析ツール（静的サイト）</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>診断 & 紹介 分析ツール</title>
 
-  <!-- UI -->
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
 
-  <!-- DataTables (Bootstrap 5) -->
-  <link href="https://cdn.datatables.net/2.3.6/css/dataTables.bootstrap5.min.css" rel="stylesheet">
-  <link href="https://cdn.datatables.net/responsive/3.0.7/css/responsive.bootstrap5.min.css" rel="stylesheet">
+  <!-- DataTables (Bootstrap 5 integration) -->
+  <link href="https://cdn.datatables.net/2.3.6/css/dataTables.bootstrap5.min.css" rel="stylesheet"/>
 
-  <link href="./style.css" rel="stylesheet" />
+  <link href="styles.css" rel="stylesheet"/>
 </head>
 
 <body>
-  <div class="container py-4">
-    <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-3">
-      <div>
-        <h1 class="h3 mb-1">診断データ解析ツール（静的サイト）</h1>
-        <div class="text-muted small">
-          Excel（.xlsx）をブラウザ内で読み込み、集計・可視化・品質チェックを行います。データはページ外へ送信しません（解析はローカル処理）。
-          <span class="d-inline-block ms-1">※ライブラリはCDNから読み込みます。</span>
+  <header class="app-header border-bottom">
+    <div class="container-fluid app-max">
+      <div class="py-3 d-flex flex-column flex-md-row align-items-md-center gap-3">
+        <div class="flex-grow-1">
+          <div class="d-flex align-items-center gap-2">
+            <h1 class="h5 mb-0">診断 & 紹介 分析ツール</h1>
+            <span class="badge text-bg-light border">静的 / ローカル解析</span>
+          </div>
+          <div class="text-secondary small mt-1">
+            使うシート：<span class="fw-semibold">diagnosis</span> と <span class="fw-semibold">referral_events</span> のみ（その他は無視）
+          </div>
+        </div>
+
+        <div class="d-flex align-items-center gap-3">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="toggleMaskPII" checked>
+            <label class="form-check-label" for="toggleMaskPII">PIIマスク</label>
+          </div>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="toggleHideUnnamed" checked>
+            <label class="form-check-label" for="toggleHideUnnamed">Unnamed列を隠す</label>
+          </div>
         </div>
       </div>
-      <div class="text-end">
-        <a class="small" href="./README.md" target="_blank" rel="noreferrer">使い方（README）</a>
+
+      <div class="pb-3">
+        <div id="dropZone" class="drop-zone">
+          <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
+            <div>
+              <div class="fw-semibold">ここに .xlsx をドラッグ&ドロップ</div>
+              <div class="small text-secondary">またはクリックして選択（ブラウザ内で処理。サーバー送信なし）</div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <button id="btnPickFile" class="btn btn-primary btn-sm" type="button">ファイルを選択</button>
+              <button id="btnLoadSample" class="btn btn-outline-secondary btn-sm" type="button" title="（任意）同梱サンプルはありません">サンプル</button>
+            </div>
+          </div>
+          <input id="fileInput" type="file" accept=".xlsx" hidden />
+        </div>
+
+        <div class="mt-2 d-flex flex-column flex-md-row gap-2 justify-content-between align-items-md-center">
+          <div class="small">
+            <span class="text-secondary">読み込み:</span>
+            <span id="fileName" class="fw-semibold">未選択</span>
+            <span id="loadStatus" class="ms-2 text-secondary"></span>
+          </div>
+          <div class="small text-secondary">
+            解析対象: 診断 <span id="diagCount">—</span> 件 / お気に入り <span id="favCount">—</span> 件 / 紹介イベント <span id="refCount">—</span> 件
+          </div>
+        </div>
       </div>
     </div>
+  </header>
 
-    <div class="card mb-3">
-      <div class="card-body">
-        <div class="row g-3 align-items-end">
-          <div class="col-lg-6">
-            <label class="form-label">Excelファイル</label>
-            <input id="fileInput" type="file" class="form-control" accept=".xlsx,.xls" />
-            <div class="form-text">
-              例：このチャットで渡した「診断データ.xlsx」
-            </div>
-          </div>
-          <div class="col-lg-6">
-            <div class="d-flex flex-wrap gap-3">
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="maskPII" checked>
-                <label class="form-check-label" for="maskPII">PIIをマスク（name/emailなど）</label>
-              </div>
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="showJsonCols">
-                <label class="form-check-label" for="showJsonCols">JSON列を表示（*_json / raw_json など）</label>
-              </div>
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="showUnnamedCols">
-                <label class="form-check-label" for="showUnnamedCols">Unnamed列を表示</label>
-              </div>
-            </div>
+  <main class="pb-5">
+    <div class="container-fluid app-max">
 
-            <div class="mt-3">
-              <div id="loadStatus" class="small text-muted">ファイル未読込</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <ul class="nav nav-tabs" id="mainTabs" role="tablist">
-      <li class="nav-item" role="presentation">
-        <button class="nav-link active" id="tab-overview" data-bs-toggle="tab" data-bs-target="#pane-overview" type="button" role="tab">ダッシュボード</button>
-      </li>
-
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-diagnosis" data-bs-toggle="tab" data-bs-target="#pane-diagnosis" type="button" role="tab">診断分析</button>
-      </li>
-
-
-
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-referral" data-bs-toggle="tab" data-bs-target="#pane-referral" type="button" role="tab">紹介深掘り</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-sheet" data-bs-toggle="tab" data-bs-target="#pane-sheet" type="button" role="tab">シート探索</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-profile" data-bs-toggle="tab" data-bs-target="#pane-profile" type="button" role="tab">プロファイル</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-charts" data-bs-toggle="tab" data-bs-target="#pane-charts" type="button" role="tab">可視化</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-export" data-bs-toggle="tab" data-bs-target="#pane-export" type="button" role="tab">エクスポート</button>
-      </li>
-    </ul>
-
-    <div class="tab-content border border-top-0 rounded-bottom p-3 bg-white" id="mainTabsContent">
-
-      <!-- Overview -->
-      <div class="tab-pane fade show active" id="pane-overview" role="tabpanel" aria-labelledby="tab-overview">
-        <div id="overviewEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
-        </div>
-
-        <div id="overviewContent" class="d-none">
-          <div class="row g-3 mb-3">
-            <div class="col-md-3">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">シート数</div>
-                  <div class="h4 mb-0" id="kpiSheetCount">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">総行数（全シート合計）</div>
-                  <div class="h4 mb-0" id="kpiTotalRows">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">diagnosis 行数</div>
-                  <div class="h4 mb-0" id="kpiDiagnosisRows">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-3">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">referral_events 行数</div>
-                  <div class="h4 mb-0" id="kpiReferralEventsRows">-</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3">
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="d-flex align-items-center justify-content-between mb-2">
-                    <div class="fw-semibold">シート一覧</div>
-                    <div class="small text-muted">クリックで探索へ</div>
-                  </div>
-                  <div class="table-responsive">
-                    <table class="table table-sm align-middle mb-0" id="sheetSummaryTable">
-                      <thead>
-                        <tr>
-                          <th>sheet</th>
-                          <th class="text-end">rows</th>
-                          <th class="text-end">cols</th>
-                          <th class="text-end">missing%</th>
-                        </tr>
-                      </thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">自動インサイト（代表シートがある場合）</div>
-                  <div id="insights" class="small"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">診断：type 上位（diagnosis）</div>
-                  <div id="plotTypeTop" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">紹介：イベント推移（events_daily / referral_events）</div>
-                  <div id="plotEventsDaily" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">紹介：Sankey（sankey_visits / sankey_completes がある場合）</div>
-                  <div class="row g-3">
-                    <div class="col-lg-6">
-                      <div class="small text-muted mb-1">Visits</div>
-                      <div id="plotSankeyVisits" class="plotBox"></div>
-                    </div>
-                    <div class="col-lg-6">
-                      <div class="small text-muted mb-1">Completes</div>
-                      <div id="plotSankeyCompletes" class="plotBox"></div>
-                    </div>
-                  </div>
-                  <div class="small text-muted mt-2">
-                    ※Sankeyは source / target / value の3列を想定
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
+      <div id="noDataHint" class="alert alert-light border mt-3">
+        <div class="fw-semibold">まず .xlsx を読み込んでください</div>
+        <div class="small text-secondary mt-1">
+          このツールは <span class="fw-semibold">diagnosis</span> と <span class="fw-semibold">referral_events</span> シートだけを使って分析します。
         </div>
       </div>
 
-      <!-- Diagnosis -->
-      <div class="tab-pane fade" id="pane-diagnosis" role="tabpanel" aria-labelledby="tab-diagnosis">
-        <div id="diagEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
-        </div>
-
-        <div id="diagNoSheet" class="d-none text-muted">
-          diagnosis シートが見つかりません。
-        </div>
-
-        <div id="diagContent" class="d-none">
-
-          <div class="row g-3 align-items-end mb-3">
-            <div class="col-lg-3">
-              <label class="form-label">期間（開始）</label>
-              <input id="diagDateStart" type="date" class="form-control" />
-            </div>
-            <div class="col-lg-3">
-              <label class="form-label">期間（終了）</label>
-              <input id="diagDateEnd" type="date" class="form-control" />
-            </div>
-            <div class="col-lg-2">
-              <label class="form-label">gender</label>
-              <select id="diagGender" class="form-select">
-                <option value="all">all</option>
-                <option value="female">female</option>
-                <option value="male">male</option>
-                <option value="unknown">unknown</option>
-              </select>
-            </div>
-            <div class="col-lg-4">
-              <label class="form-label">type</label>
-              <select id="diagType" class="form-select"></select>
-            </div>
-
-            <div class="col-lg-2">
-              <label class="form-label">年齢 min</label>
-              <input id="diagAgeMin" type="number" class="form-control" placeholder="例: 13" />
-            </div>
-            <div class="col-lg-2">
-              <label class="form-label">年齢 max</label>
-              <input id="diagAgeMax" type="number" class="form-control" placeholder="例: 26" />
-            </div>
-            <div class="col-lg-4 d-flex flex-wrap gap-3 align-items-center">
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="diagIncludeMissingAge" checked>
-                <label class="form-check-label" for="diagIncludeMissingAge">年齢欠損を含める</label>
-              </div>
-              <div class="d-flex flex-wrap gap-2">
-                <button id="btnDiagApply" class="btn btn-primary btn-sm">適用</button>
-                <button id="btnDiagReset" class="btn btn-outline-secondary btn-sm">リセット</button>
-              </div>
-              <div class="small text-muted" id="diagN">N=-</div>
-            </div>
-          </div>
-
-          <div class="row g-3 mb-3">
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">件数</div>
-                  <div class="h4 mb-0" id="diagKpiRows">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">Interested率</div>
-                  <div class="h4 mb-0" id="diagKpiInterestedRate">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">ユニークemail</div>
-                  <div class="h4 mb-0" id="diagKpiUniqueEmail">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">年齢中央値</div>
-                  <div class="h4 mb-0" id="diagKpiAgeMedian">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">female比率</div>
-                  <div class="h4 mb-0" id="diagKpiFemaleRate">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">raw_json解析</div>
-                  <div class="h4 mb-0" id="diagKpiJsonParseRate">-</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3">
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">type 件数（上位）</div>
-                  <div id="plotDiagTypeCount" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">type別 Interested率（上位）</div>
-                  <div id="plotDiagInterestedByType" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-                    <div class="fw-semibold">type サマリ</div>
-                    <div class="small text-muted">n, Interested率, 軸平均など（上位）</div>
-                  </div>
-                  <div class="table-responsive">
-                    <table class="table table-sm table-hover align-middle" id="diagTypeTable">
-                      <thead>
-                        <tr>
-                          <th>type</th>
-                          <th class="text-end">n</th>
-                          <th class="text-end">interested</th>
-                          <th class="text-end">rate</th>
-                          <th class="text-end">axisA</th>
-                          <th class="text-end">axisB</th>
-                          <th class="text-end">axisC</th>
-                          <th class="text-end">axisD</th>
-                          <th class="text-end">age_mean</th>
-                        </tr>
-                      </thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                  <div class="small text-muted mt-2">※表示は上位50タイプ。フィルタ適用後に再計算されます。</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap gap-2 align-items-end justify-content-between mb-2">
-                    <div class="fw-semibold">軸スコア分布（Box）</div>
-                    <div class="d-flex flex-wrap gap-2">
-                      <select id="diagAxisSelect" class="form-select form-select-sm">
-                        <option value="axisA">axisA</option>
-                        <option value="axisB">axisB</option>
-                        <option value="axisC">axisC</option>
-                        <option value="axisD">axisD</option>
-                      </select>
-                      <select id="diagAxisGroupBy" class="form-select form-select-sm">
-                        <option value="type">group: type</option>
-                        <option value="gender">group: gender</option>
-                        <option value="ageBin">group: age bin</option>
-                      </select>
-                      <input id="diagAxisTopN" type="number" class="form-control form-control-sm" style="max-width: 110px" value="10" min="3" max="30" />
-                    </div>
-                  </div>
-                  <div id="plotDiagAxisBox" class="plotBox"></div>
-                  <div class="small text-muted mt-2">※group=type の場合、上位Nタイプのみ表示。</div>
-                </div>
-              </div>
-            </div>
-
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">相関（axis + age + interested）</div>
-                  <div id="plotDiagCorr" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-4">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">Interested率：年齢帯</div>
-                  <div id="plotDiagInterestedByAge" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-4">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">Interested率：gender</div>
-                  <div id="plotDiagInterestedByGender" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-4">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">Dominant axis（最大軸）</div>
-                  <div id="plotDiagDominantAxis" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap gap-2 align-items-end justify-content-between mb-2">
-                    <div>
-                      <div class="fw-semibold">質問（answers）分析</div>
-                      <div class="small text-muted">raw_json 内の answers（A1〜D10）を利用</div>
-                    </div>
-                    <div class="d-flex flex-wrap gap-2">
-                      <select id="diagQKey" class="form-select form-select-sm"></select>
-                      <button id="btnDiagDrawQ" class="btn btn-outline-primary btn-sm">描画</button>
-                    </div>
-                  </div>
-
-                  <div class="row g-3">
-                    <div class="col-lg-6">
-                      <div class="small text-muted mb-1">分布（全体）</div>
-                      <div id="plotDiagQHist" class="plotBox"></div>
-                    </div>
-                    <div class="col-lg-6">
-                      <div class="small text-muted mb-1">平均：type別（上位）</div>
-                      <div id="plotDiagQMeanByType" class="plotBox"></div>
-                    </div>
-                  </div>
-
-                  <div class="row g-3 mt-0">
-                    <div class="col-lg-12">
-                      <div class="small text-muted">
-                        Interested=1 の平均: <span class="fw-semibold" id="diagQMeanInterested">-</span>
-                        <span class="mx-2">/</span>
-                        Interested=0 の平均: <span class="fw-semibold" id="diagQMeanNotInterested">-</span>
-                        <span class="mx-2">/</span>
-                        差分: <span class="fw-semibold" id="diagQMeanDiff">-</span>
-                      </div>
-                    </div>
-                  </div>
-
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mt-0">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">データ品質（diagnosis）</div>
-                  <div class="row g-3">
-                    <div class="col-md-3">
-                      <div class="border rounded p-2">
-                        <div class="small text-muted">email 重複数</div>
-                        <div class="h5 mb-0" id="diagQualityDupEmail">-</div>
-                      </div>
-                    </div>
-                    <div class="col-md-3">
-                      <div class="border rounded p-2">
-                        <div class="small text-muted">年齢パース不可</div>
-                        <div class="h5 mb-0" id="diagQualityBadAge">-</div>
-                      </div>
-                    </div>
-                    <div class="col-md-3">
-                      <div class="border rounded p-2">
-                        <div class="small text-muted">軸の範囲外</div>
-                        <div class="h5 mb-0" id="diagQualityAxisOut">-</div>
-                      </div>
-                    </div>
-                    <div class="col-md-3">
-                      <div class="border rounded p-2">
-                        <div class="small text-muted">createdAt 欠損</div>
-                        <div class="h5 mb-0" id="diagQualityNoDate">-</div>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="small text-muted mt-2">※フィルタ適用後の件数で表示。</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-        </div>
+      <!-- Tabs -->
+      <div class="sticky-tabs mt-3">
+        <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="tab-dashboard" data-bs-toggle="tab" data-bs-target="#pane-dashboard" type="button" role="tab">ダッシュボード</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-diagnosis" data-bs-toggle="tab" data-bs-target="#pane-diagnosis" type="button" role="tab">診断</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-favorites" data-bs-toggle="tab" data-bs-target="#pane-favorites" type="button" role="tab">お気に入り</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-referral" data-bs-toggle="tab" data-bs-target="#pane-referral" type="button" role="tab">紹介</button>
+          </li>
+        </ul>
       </div>
 
-<!-- Referral Deep Dive -->
-      <div class="tab-pane fade" id="pane-referral" role="tabpanel" aria-labelledby="tab-referral">
-        <div id="referralEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
+      <div class="tab-content pt-3" id="tabContent">
+
+        <!-- Dashboard -->
+        <div class="tab-pane fade show active" id="pane-dashboard" role="tabpanel">
+          <div id="dashKpis" class="row g-3"></div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center">
+                    <div class="fw-semibold">診断 / お気に入り 推移</div>
+                    <div class="small text-secondary">日次</div>
+                  </div>
+                  <div id="chartDashDiagnosisTrend" class="plot"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center">
+                    <div class="fw-semibold">紹介イベント 推移</div>
+                    <div class="small text-secondary">share / visit / complete</div>
+                  </div>
+                  <div id="chartDashReferralTrend" class="plot"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <details class="mt-3">
+            <summary class="summary-toggle">データ概要（列サマリ）</summary>
+            <div class="row g-3 mt-1">
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">diagnosis 列サマリ</div>
+                    <div id="diagProfile"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">referral_events 列サマリ</div>
+                    <div id="refProfile"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
 
-        <div id="referralContent" class="d-none">
-          <div class="row g-3 mb-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">期間フィルタ（referral_events.timestamp）</div>
-                  <div class="row g-3 align-items-end">
-                    <div class="col-md-4">
-                      <label class="form-label">開始日</label>
-                      <input type="date" id="refStartDate" class="form-control" />
-                    </div>
-                    <div class="col-md-4">
-                      <label class="form-label">終了日</label>
-                      <input type="date" id="refEndDate" class="form-control" />
-                    </div>
-                    <div class="col-md-4 d-flex flex-wrap gap-2">
-                      <button id="btnRefApply" class="btn btn-primary btn-sm">適用</button>
-                      <button id="btnRefReset" class="btn btn-outline-secondary btn-sm">全期間</button>
-                    </div>
-                  </div>
-                  <div class="small text-muted mt-2" id="refFilterHint">-</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mb-3" id="refKpiRow">
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">share</div>
-                  <div class="h4 mb-0" id="kpiRefShare">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">referral_visit</div>
-                  <div class="h4 mb-0" id="kpiRefVisit">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">referral_complete</div>
-                  <div class="h4 mb-0" id="kpiRefComplete">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">share→visit</div>
-                  <div class="h4 mb-0" id="kpiRefRateSV">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">visit→complete</div>
-                  <div class="h4 mb-0" id="kpiRefRateVC">-</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-2">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="small text-muted">share→complete</div>
-                  <div class="h4 mb-0" id="kpiRefRateSC">-</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mb-3">
-            <div class="col-lg-8">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">イベント推移（share / visit / complete）</div>
-                  <div id="plotRefTimeSeries" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-4">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">share プラットフォーム内訳</div>
-                  <div id="plotSharePlatform" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mb-3">
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">referrer type 別の紹介効率</div>
-                  <div id="plotTypePerformance" class="plotBox"></div>
-                  <div class="small text-muted mt-2">※shareイベントのpayload（userType）から referrer type を推定します。</div>
-                </div>
-              </div>
-            </div>
-            <div class="col-lg-6">
-              <div class="card h-100">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">referrer別：visitors vs completes</div>
-                  <div id="plotRefScatter" class="plotBox"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-                    <div class="row g-3 mb-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">紹介経由ユーザーの診断特徴（email join）</div>
-                  <div class="row g-3">
-                    <div class="col-lg-4">
-                      <div class="small text-muted">紹介完了ユーザー（ユニーク email）</div>
-                      <div class="h4 mb-3" id="kpiReferredUniqueEmail">-</div>
-
-                      <div class="small text-muted">diagnosis と一致（ユニーク email）</div>
-                      <div class="h4 mb-3" id="kpiReferredMatched">-</div>
-
-                      <div class="small text-muted">interested=1（紹介完了 / 全体）</div>
-                      <div class="h4 mb-0" id="kpiReferredInterested">-</div>
-
-                      <div class="small text-muted mt-2">
-                        ※ referral_complete の payload（userEmail）と diagnosis.email を突合します。<br/>
-                        個人を特定できる情報は表示しません（件数のみ）。
-                      </div>
-                    </div>
-                    <div class="col-lg-8">
-                      <div id="plotReferredTypeCompare" class="plotBox"></div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div><div class="row g-3 mb-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-                    <div class="fw-semibold">リファラー一覧（Leaderboard）</div>
-                    <div class="small text-muted">行クリックで詳細へ</div>
-                  </div>
-                  <div class="table-responsive">
-                    <table id="referrerTable" class="table table-striped table-bordered w-100">
-                      <thead></thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                  <div class="small text-muted mt-2">
-                    ※ 原則 referral_events から集計します（referrer_summary がある場合は referrerId の候補に利用します）。
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3 mb-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-                    <div class="fw-semibold">リファラー詳細</div>
-                    <div class="d-flex flex-wrap gap-2">
-                      <select id="referrerSelect" class="form-select form-select-sm" style="min-width: 260px;"></select>
-                      <button id="btnRefDetailRefresh" class="btn btn-outline-secondary btn-sm">更新</button>
-                    </div>
-                  </div>
-
-                  <div id="referrerDetailKpis" class="row g-3"></div>
-
-                  <hr/>
-
-                  <div class="row g-3">
-                    <div class="col-lg-6">
-                      <div class="fw-semibold mb-2">招待ユーザーの推移</div>
-                      <div id="plotReferrerTimeline" class="plotBox"></div>
-                    </div>
-                    <div class="col-lg-6">
-                      <div class="fw-semibold mb-2">Time to complete（hours）</div>
-                      <div id="plotHoursToComplete" class="plotBox"></div>
-                    </div>
-                  </div>
-
-                  <hr/>
-
-                  <div class="fw-semibold mb-2">Edge一覧（referrer → user）</div>
-                  <div class="table-responsive">
-                    <table id="refEdgesTable" class="table table-sm table-striped table-bordered w-100">
-                      <thead></thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="row g-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">紹介ネットワーク（Sankey）</div>
-                  <div class="row g-3 align-items-end mb-2">
-                    <div class="col-md-4">
-                      <label class="form-label">種類</label>
-                      <select id="refSankeyKind" class="form-select form-select-sm">
-                        <option value="visits">Visits</option>
-                        <option value="completes">Completes</option>
-                      </select>
-                    </div>
-                    <div class="col-md-4">
-                      <label class="form-label">データ</label>
-                      <select id="refSankeyVariant" class="form-select form-select-sm">
-                        <option value="prefer_acyclic">acyclicを優先</option>
-                        <option value="raw">rawを優先</option>
-                      </select>
-                    </div>
-                    <div class="col-md-4">
-                      <label class="form-label">min value（link）</label>
-                      <input id="refSankeyMinValue" type="number" class="form-control form-control-sm" value="1" min="0" step="1" />
-                    </div>
-                  </div>
-
-                  <div id="plotReferralSankey" class="plotBox"></div>
-                  <div class="small text-muted mt-2" id="refNetworkStats">-</div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </div>
-
-      <!-- Sheet explorer -->
-      <div class="tab-pane fade" id="pane-sheet" role="tabpanel" aria-labelledby="tab-sheet">
-        <div id="sheetEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
-        </div>
-
-        <div id="sheetContent" class="d-none">
-          <div class="row g-3 align-items-end mb-3">
-            <div class="col-lg-6">
-              <label class="form-label">対象シート</label>
-              <select id="sheetSelect" class="form-select"></select>
-            </div>
-            <div class="col-lg-6 d-flex flex-wrap gap-2 justify-content-lg-end">
-              <button id="btnRefreshView" class="btn btn-outline-secondary btn-sm">再描画</button>
-              <button id="btnGoProfile" class="btn btn-outline-primary btn-sm">プロファイルへ</button>
-              <button id="btnGoCharts" class="btn btn-outline-primary btn-sm">可視化へ</button>
-            </div>
-          </div>
-
-          <div class="row g-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
-                    <div class="fw-semibold">テーブル</div>
-                    <div class="small text-muted" id="sheetMeta">-</div>
-                  </div>
-                  <div class="table-responsive">
-                    <table id="dataTable" class="table table-striped table-bordered w-100">
-                      <thead></thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                  <div class="small text-muted mt-2">
-                    ※検索・並び替え・ページング対応（DataTables）
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Profile -->
-      <div class="tab-pane fade" id="pane-profile" role="tabpanel" aria-labelledby="tab-profile">
-        <div id="profileEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
-        </div>
-
-        <div id="profileContent" class="d-none">
-          <div class="row g-3 align-items-end mb-3">
-            <div class="col-lg-6">
-              <label class="form-label">対象シート</label>
-              <select id="profileSheetSelect" class="form-select"></select>
-            </div>
-            <div class="col-lg-6 d-flex flex-wrap gap-2 justify-content-lg-end">
-              <button id="btnProfileRecalc" class="btn btn-outline-secondary btn-sm">再計算</button>
-            </div>
-          </div>
-
-          <div class="row g-3">
-            <div class="col-lg-12">
-              <div class="card">
-                <div class="card-body">
-                  <div class="fw-semibold mb-2">列プロファイル</div>
-                  <div class="table-responsive">
-                    <table class="table table-sm table-hover align-middle" id="profileTable">
-                      <thead>
-                        <tr>
-                          <th>column</th>
-                          <th>type</th>
-                          <th class="text-end">missing</th>
-                          <th class="text-end">unique</th>
-                          <th class="text-end">min</th>
-                          <th class="text-end">p50</th>
-                          <th class="text-end">max</th>
-                          <th>top values (up to 5)</th>
-                        </tr>
-                      </thead>
-                      <tbody></tbody>
-                    </table>
-                  </div>
-                  <div class="small text-muted mt-2">
-                    ※数値列は min/p50/max を表示。文字列列は top values を表示。
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </div>
-
-      <!-- Charts -->
-      <div class="tab-pane fade" id="pane-charts" role="tabpanel" aria-labelledby="tab-charts">
-        <div id="chartsEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
-        </div>
-
-        <div id="chartsContent" class="d-none">
-          <div class="row g-3 align-items-end mb-3">
-            <div class="col-lg-4">
-              <label class="form-label">対象シート</label>
-              <select id="chartsSheetSelect" class="form-select"></select>
-            </div>
-            <div class="col-lg-3">
-              <label class="form-label">可視化タイプ</label>
-              <select id="chartType" class="form-select">
-                <option value="hist">ヒストグラム（数値）</option>
-                <option value="barCount">棒（カテゴリ件数）</option>
-                <option value="scatter">散布図（数値×数値）</option>
-                <option value="lineTime">折れ線（日時×数値）</option>
-                <option value="corr">相関ヒートマップ（数値列）</option>
-                <option value="sankey">Sankey（source/target/value）</option>
-              </select>
-            </div>
-            <div class="col-lg-3">
-              <label class="form-label">X列</label>
-              <select id="xCol" class="form-select"></select>
-            </div>
-            <div class="col-lg-2">
-              <label class="form-label">Y列</label>
-              <select id="yCol" class="form-select"></select>
-            </div>
-          </div>
-
-          <div class="d-flex flex-wrap gap-2 mb-3">
-            <button id="btnDrawChart" class="btn btn-primary btn-sm">描画</button>
-            <button id="btnAutoPick" class="btn btn-outline-secondary btn-sm">自動選択</button>
-            <span class="small text-muted align-self-center" id="chartHint">-</span>
-          </div>
-
+        <!-- Diagnosis -->
+        <div class="tab-pane fade" id="pane-diagnosis" role="tabpanel">
           <div class="card">
             <div class="card-body">
-              <div id="chartArea" class="plotBox"></div>
+              <div class="d-flex flex-column flex-lg-row gap-2 align-items-lg-end">
+                <div class="flex-grow-1">
+                  <div class="fw-semibold">フィルタ</div>
+                  <div class="row g-2 mt-1">
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">開始日</label>
+                      <input id="diagDateFrom" type="date" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">終了日</label>
+                      <input id="diagDateTo" type="date" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">Gender</label>
+                      <select id="diagGender" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                        <option value="female">female</option>
+                        <option value="male">male</option>
+                        <option value="unknown">unknown</option>
+                      </select>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">Type</label>
+                      <select id="diagType" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">年齢 min</label>
+                      <input id="diagAgeMin" type="number" class="form-control form-control-sm" placeholder="例: 13"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">年齢 max</label>
+                      <input id="diagAgeMax" type="number" class="form-control form-control-sm" placeholder="例: 22"/>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">紹介（complete）</label>
+                      <select id="diagReferral" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                        <option value="referred">紹介あり</option>
+                        <option value="not">紹介なし</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">表示</label>
+                      <select id="diagUnit" class="form-select form-select-sm">
+                        <option value="record" selected>診断レコード</option>
+                        <option value="user">ユーザー（email重複除外）</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="d-flex gap-2">
+                  <button id="btnExportDiagCSV" class="btn btn-outline-primary btn-sm" type="button">CSV出力</button>
+                  <button id="btnExportDiagJSON" class="btn btn-outline-secondary btn-sm" type="button">JSON出力</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="diagKpis" class="row g-3 mt-0"></div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">Type 分布</div>
+                  <div id="chartDiagTypeCount" class="plot"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">お気に入り率（Type別）</div>
+                  <div id="chartDiagTypeFavRate" class="plot"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12">
+              <div class="card">
+                <div class="card-body">
+                  <div class="d-flex flex-column flex-md-row justify-content-between gap-2">
+                    <div class="fw-semibold">相関（axis / age / interested）</div>
+                    <div class="small text-secondary">Pearson（欠損はペアワイズ除外）</div>
+                  </div>
+                  <div id="chartDiagCorr" class="plot plot-tall"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <details class="mt-3">
+            <summary class="summary-toggle">高度な分析（軸分布 / 質問差分 / データ品質 / 生データ）</summary>
+
+            <div class="row g-3 mt-1">
+              <div class="col-12 col-lg-6">
+                <div class="card h-100">
+                  <div class="card-body">
+                    <div class="d-flex gap-2 align-items-end flex-wrap">
+                      <div class="flex-grow-1">
+                        <label class="form-label form-label-sm">軸</label>
+                        <select id="diagAxisPick" class="form-select form-select-sm">
+                          <option value="axisA">axisA</option>
+                          <option value="axisB">axisB</option>
+                          <option value="axisC">axisC</option>
+                          <option value="axisD">axisD</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label class="form-label form-label-sm">表示</label>
+                        <select id="diagAxisView" class="form-select form-select-sm">
+                          <option value="hist" selected>ヒストグラム</option>
+                          <option value="box">Box（Type別・上位10）</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div id="chartDiagAxis" class="plot"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-12 col-lg-6">
+                <div class="card h-100">
+                  <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                      <div class="fw-semibold">質問（answers）差分</div>
+                      <div class="small text-secondary">お気に入り vs 非お気に入り</div>
+                    </div>
+                    <div id="chartDiagAnswerDiff" class="plot"></div>
+                    <div id="diagAnswersHint" class="small text-secondary mt-2"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="row g-3 mt-0">
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">データ品質</div>
+                    <div id="diagQuality"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">お気に入り上位シグナル（数値）</div>
+                    <div id="diagSignalTable"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card mt-3">
+              <div class="card-body">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                  <div class="fw-semibold">診断データ（フィルタ後）</div>
+                  <div class="small text-secondary">検索/ソート可</div>
+                </div>
+                <div class="table-responsive">
+                  <table id="tableDiagnosis" class="table table-sm table-striped align-middle w-100"></table>
+                </div>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- Favorites -->
+        <div class="tab-pane fade" id="pane-favorites" role="tabpanel">
+          <div class="card">
+            <div class="card-body">
+              <div class="d-flex flex-column flex-lg-row gap-2 align-items-lg-end">
+                <div class="flex-grow-1">
+                  <div class="fw-semibold">フィルタ（お気に入りのみ）</div>
+                  <div class="row g-2 mt-1">
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">開始日</label>
+                      <input id="favDateFrom" type="date" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">終了日</label>
+                      <input id="favDateTo" type="date" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">Gender</label>
+                      <select id="favGender" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                        <option value="female">female</option>
+                        <option value="male">male</option>
+                        <option value="unknown">unknown</option>
+                      </select>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">Type</label>
+                      <select id="favType" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">年齢 min</label>
+                      <input id="favAgeMin" type="number" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">年齢 max</label>
+                      <input id="favAgeMax" type="number" class="form-control form-control-sm"/>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">紹介者</label>
+                      <select id="favReferrer" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">集計単位</label>
+                      <select id="favUnit" class="form-select form-select-sm">
+                        <option value="user" selected>ユーザー（email重複除外）</option>
+                        <option value="record">診断レコード</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="d-flex gap-2">
+                  <button id="btnExportFavCSV" class="btn btn-outline-primary btn-sm" type="button">CSV出力</button>
+                  <button id="btnExportFavJSON" class="btn btn-outline-secondary btn-sm" type="button">JSON出力</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="favKpis" class="row g-3 mt-0"></div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">お気に入り 推移</div>
+                  <div id="chartFavTrend" class="plot"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">お気に入り Type 分布</div>
+                  <div id="chartFavTypeCount" class="plot"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12">
+              <div class="card">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center">
+                    <div class="fw-semibold">お気に入りの特徴（差分）</div>
+                    <div class="small text-secondary">お気に入り vs 非お気に入り（同じ集計単位）</div>
+                  </div>
+
+                  <div class="row g-3 mt-1">
+                    <div class="col-12 col-lg-6">
+                      <div class="small text-secondary mb-1">軸（mean差）</div>
+                      <div id="chartFavAxisDiff" class="plot"></div>
+                    </div>
+                    <div class="col-12 col-lg-6">
+                      <div class="small text-secondary mb-1">質問（mean差・上位10）</div>
+                      <div id="chartFavAnswerDiff" class="plot"></div>
+                      <div id="favAnswersHint" class="small text-secondary mt-2"></div>
+                    </div>
+                  </div>
+
+                  <div class="mt-3">
+                    <div class="fw-semibold mb-2">差分ランキング（数値特徴）</div>
+                    <div id="favSignalTable"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card mt-3">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div class="fw-semibold">お気に入り一覧（フィルタ後）</div>
+                <div class="small text-secondary">検索/ソート可</div>
+              </div>
+              <div class="table-responsive">
+                <table id="tableFavorites" class="table table-sm table-striped align-middle w-100"></table>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <!-- Export -->
-      <div class="tab-pane fade" id="pane-export" role="tabpanel" aria-labelledby="tab-export">
-        <div id="exportEmpty" class="text-muted">
-          まずExcelファイルを選択してください。
+        <!-- Referral -->
+        <div class="tab-pane fade" id="pane-referral" role="tabpanel">
+          <div class="card">
+            <div class="card-body">
+              <div class="d-flex flex-column flex-lg-row gap-2 align-items-lg-end">
+                <div class="flex-grow-1">
+                  <div class="fw-semibold">フィルタ（紹介イベント）</div>
+                  <div class="row g-2 mt-1">
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">開始日</label>
+                      <input id="refDateFrom" type="date" class="form-control form-control-sm"/>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">終了日</label>
+                      <input id="refDateTo" type="date" class="form-control form-control-sm"/>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">eventType</label>
+                      <select id="refEventType" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                        <option value="share">share</option>
+                        <option value="referral_visit">referral_visit</option>
+                        <option value="referral_complete">referral_complete</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">platform（share）</label>
+                      <select id="refPlatform" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                      </select>
+                    </div>
+
+                    <div class="col-12 col-md-6">
+                      <label class="form-label form-label-sm">紹介者（referrerId）</label>
+                      <select id="refReferrer" class="form-select form-select-sm">
+                        <option value="all">すべて</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">Sankey</label>
+                      <select id="refSankeyMode" class="form-select form-select-sm">
+                        <option value="visits" selected>visits</option>
+                        <option value="completes">completes</option>
+                      </select>
+                    </div>
+
+                    <div class="col-6 col-md-3">
+                      <label class="form-label form-label-sm">min edge</label>
+                      <input id="refMinEdge" type="number" class="form-control form-control-sm" value="1" min="1"/>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="d-flex gap-2">
+                  <button id="btnExportRefCSV" class="btn btn-outline-primary btn-sm" type="button">CSV出力</button>
+                  <button id="btnExportRefJSON" class="btn btn-outline-secondary btn-sm" type="button">JSON出力</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="refKpis" class="row g-3 mt-0"></div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">紹介ファネル</div>
+                  <div id="chartRefFunnel" class="plot"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12 col-lg-6">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="fw-semibold">イベント推移</div>
+                  <div id="chartRefTrend" class="plot"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3 mt-0">
+            <div class="col-12 col-lg-7">
+              <div class="card">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div class="fw-semibold">紹介者ランキング</div>
+                    <div class="small text-secondary">クリックで詳細</div>
+                  </div>
+                  <div class="table-responsive">
+                    <table id="tableReferrers" class="table table-sm table-striped align-middle w-100"></table>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12 col-lg-5">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="d-flex justify-content-between align-items-center">
+                    <div class="fw-semibold">ネットワーク（Sankey）</div>
+                    <div class="small text-secondary">referrer → user</div>
+                  </div>
+                  <div id="chartRefSankey" class="plot plot-tall"></div>
+                  <div id="refSankeyHint" class="small text-secondary mt-2"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <details class="mt-3">
+            <summary class="summary-toggle">紹介者の詳細（選択中）</summary>
+            <div class="row g-3 mt-1">
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">選択中の紹介者</div>
+                    <div id="refSelectedSummary" class="small"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-6">
+                <div class="card">
+                  <div class="card-body">
+                    <div class="fw-semibold mb-2">Time to complete（hours）</div>
+                    <div id="chartRefTTC" class="plot"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card mt-3">
+              <div class="card-body">
+                <div class="fw-semibold mb-2">エッジ一覧（referrer → user）</div>
+                <div class="table-responsive">
+                  <table id="tableRefEdges" class="table table-sm table-striped align-middle w-100"></table>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <div class="card mt-3">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div class="fw-semibold">紹介イベント（フィルタ後）</div>
+                <div class="small text-secondary">検索/ソート可</div>
+              </div>
+              <div class="table-responsive">
+                <table id="tableRefEvents" class="table table-sm table-striped align-middle w-100"></table>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div id="exportContent" class="d-none">
-          <div class="row g-3 align-items-end mb-3">
-            <div class="col-lg-6">
-              <label class="form-label">対象シート</label>
-              <select id="exportSheetSelect" class="form-select"></select>
-            </div>
-            <div class="col-lg-6 d-flex flex-wrap gap-2 justify-content-lg-end">
-              <button id="btnExportCsv" class="btn btn-outline-primary btn-sm">CSVで保存</button>
-              <button id="btnExportJson" class="btn btn-outline-primary btn-sm">JSONで保存</button>
-            </div>
-          </div>
+      </div><!-- /tab-content -->
 
-          <div class="small text-muted">
-            ※ブラウザ上でダウンロードします（サーバ不要）。PIIマスクON時は出力もマスクされます。
-          </div>
+    </div>
+  </main>
 
-          <hr/>
+  <button id="btnScrollTop" class="btn btn-secondary btn-sm scroll-top" type="button">Top</button>
 
-          <div class="small">
-            <div class="fw-semibold mb-1">補足</div>
-            <ul class="mb-0">
-              <li>テーブルのフィルタ結果だけを出力したい場合：まず「シート探索」タブで検索し、必要ならCSVを別途加工してください。</li>
-              <li>JSON列（*_json / raw_json 等）はデフォルト非表示です。必要なら上部のチェックをONにしてください。</li>
-            </ul>
-          </div>
-        </div>
-      </div>
-
-    </div> <!-- tab content -->
-  </div> <!-- container -->
-
-  <!-- Libraries -->
-  <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+  <!-- JS deps -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
-  <!-- SheetJS -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-
-  <!-- DataTables -->
   <script src="https://cdn.datatables.net/2.3.6/js/dataTables.min.js"></script>
   <script src="https://cdn.datatables.net/2.3.6/js/dataTables.bootstrap5.min.js"></script>
-  <script src="https://cdn.datatables.net/responsive/3.0.7/js/dataTables.responsive.min.js"></script>
-  <script src="https://cdn.datatables.net/responsive/3.0.7/js/responsive.bootstrap5.min.js"></script>
 
-  <!-- Plotly -->
-  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
-  <script src="./app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

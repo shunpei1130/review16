@@ -1,2910 +1,2372 @@
 
-/**
- * 診断データ解析ツール（静的サイト）
- * - Excel(.xlsx)をブラウザ内で解析（SheetJS）
- * - テーブル探索（DataTables）
- * - プロファイル/可視化（Plotly）
- */
+/* eslint-disable no-console */
+(function () {
+  'use strict';
 
-const state = {
-  workbook: null,
-  sheets: {},       // { sheetName: { headers:[], rows:[{...}] } }
-  sheetOrder: [],
-  currentSheet: null,
-  dataTable: null,
-
-  // Referral deep dive
-  referrerTable: null,
-  refEdgesTable: null,
-  referralDerived: null,           // computed caches for current filter
-  referralSelectedReferrer: null,  // selected referrerId
-};
-
-function $(id) { return document.getElementById(id); }
-
-function setStatus(msg, kind = "muted") {
-  const el = $("loadStatus");
-  el.className = "small text-" + kind;
-  el.textContent = msg;
-}
-
-function isMissing(v) {
-  return v === null || v === undefined || (typeof v === "string" && v.trim() === "") || (typeof v === "number" && Number.isNaN(v));
-}
-
-function toISODateString(d) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function parseDateInput(v) {
-  // "YYYY-MM-DD" -> local midnight Date
-  if (!v) return null;
-  const m = String(v).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
-  return new Date(y, mo - 1, d);
-}
-
-function addDays(d, n) {
-  const x = new Date(d.getTime());
-  x.setDate(x.getDate() + n);
-  return x;
-}
-
-function formatInt(n) {
-  if (n === null || n === undefined || Number.isNaN(n)) return "-";
-  return Number(n).toLocaleString();
-}
-
-function formatPct(p, digits = 1) {
-  if (p === null || p === undefined || Number.isNaN(p)) return "-";
-  return (Number(p) * 100).toFixed(digits) + "%";
-}
-
-function formatHours(h, digits = 2) {
-  if (h === null || h === undefined || Number.isNaN(h)) return "-";
-  return Number(h).toFixed(digits);
-}
-
-function parseJsonSafe(s) {
-  if (s === null || s === undefined) return {};
-  if (typeof s !== "string") return {};
-  const txt = s.trim();
-  if (!txt) return {};
-  try { return JSON.parse(txt); } catch (e) { return {}; }
-}
-
-function normalizeCellValue(v) {
-  if (v instanceof Date) return v.toISOString();
-  return v;
-}
-
-function readFileAsArrayBuffer(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error);
-    reader.onload = () => resolve(reader.result);
-    reader.readAsArrayBuffer(file);
-  });
-}
-
-function getUIFlags() {
-  return {
-    maskPII: $("maskPII").checked,
-    showJsonCols: $("showJsonCols").checked,
-    showUnnamedCols: $("showUnnamedCols").checked,
-  };
-}
-
-function shouldHideColumn(colName, flags) {
-  const c = String(colName || "");
-  if (!flags.showJsonCols) {
-    const lower = c.toLowerCase();
-    if (lower.includes("raw_json") || lower.endsWith("_json") || lower.includes("payload_json") || lower.includes("answers_json")) {
-      return true;
-    }
-  }
-  if (!flags.showUnnamedCols) {
-    if (c.startsWith("Unnamed:")) return true;
-  }
-  return false;
-}
-
-function maskEmail(email) {
-  const s = String(email);
-  const at = s.indexOf("@");
-  if (at === -1) return s.length <= 2 ? "**" : (s.slice(0, 2) + "****");
-  const local = s.slice(0, at);
-  const domain = s.slice(at);
-  if (local.length <= 2) return local[0] + "*".repeat(Math.max(1, local.length - 1)) + domain;
-  return local.slice(0, 2) + "*".repeat(Math.min(8, Math.max(2, local.length - 2))) + domain;
-}
-
-function maskName(name) {
-  const s = String(name);
-  if (s.length === 0) return s;
-  if (s.length === 1) return s + "*";
-  return s.slice(0, 1) + "*".repeat(Math.min(6, s.length - 1));
-}
-
-function maskIdLike(v) {
-  const s = String(v);
-  if (s.length <= 10) return s;
-  return s.slice(0, 6) + "…" + s.slice(-4);
-}
-
-function applyMaskForDisplay(col, v, flags) {
-  if (!flags.maskPII) return v;
-  const c = String(col || "").toLowerCase();
-  if (isMissing(v)) return v;
-
-  // Obvious PII
-  if (c === "email" || c.endsWith("email")) return maskEmail(v);
-  if (c === "name" || c.endsWith("name")) return maskName(v);
-
-  // IDs (userId/referrerId/gmail ids etc.)
-  if (c.includes("gmail_message_id")) return maskIdLike(v);
-  if (c === "userid" || c.endsWith("userid")) return maskIdLike(v);
-  if (c === "referrerid" || c.endsWith("referrerid")) return maskIdLike(v);
-  if (/(^|_)id$/.test(c)) return maskIdLike(v);
-
-  return v;
-}
-
-function detectColumnType(values) {
-  // values: non-missing sample
-  // returns: "number" | "date" | "boolean" | "string"
-  let nNum = 0, nDate = 0, nBool = 0, nStr = 0;
-  for (const v of values) {
-    if (typeof v === "number" && Number.isFinite(v)) { nNum++; continue; }
-    if (typeof v === "boolean") { nBool++; continue; }
-    if (typeof v === "string") {
-      const s = v.trim();
-      // numeric
-      if (/^-?\d+(\.\d+)?$/.test(s)) { nNum++; continue; }
-      // ISO-ish date
-      if (/^\d{4}-\d{2}-\d{2}/.test(s) || /^\d{4}\/\d{2}\/\d{2}/.test(s)) {
-        const t = Date.parse(s);
-        if (!Number.isNaN(t)) { nDate++; continue; }
-      }
-      // fallback
-      nStr++;
-      continue;
-    }
-    // others -> string
-    nStr++;
-  }
-  const total = Math.max(1, values.length);
-  if (nNum / total >= 0.8) return "number";
-  if (nDate / total >= 0.8) return "date";
-  if (nBool / total >= 0.8) return "boolean";
-  return "string";
-}
-
-function safeNumber(v) {
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "string") {
-    const s = v.trim();
-    if (s === "") return null;
-    const x = Number(s);
-    return Number.isFinite(x) ? x : null;
-  }
-  return null;
-}
-
-function safeDate(v) {
-  if (v instanceof Date) return v;
-  if (typeof v === "string") {
-    const t = Date.parse(v);
-    if (!Number.isNaN(t)) return new Date(t);
-  }
-  return null;
-}
-
-function median(sortedNums) {
-  const n = sortedNums.length;
-  if (n === 0) return null;
-  const mid = Math.floor(n / 2);
-  if (n % 2 === 1) return sortedNums[mid];
-  return (sortedNums[mid - 1] + sortedNums[mid]) / 2;
-}
-
-function quantile(sortedNums, q) {
-  const n = sortedNums.length;
-  if (n === 0) return null;
-  const pos = (n - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  if (sortedNums[base + 1] === undefined) return sortedNums[base];
-  return sortedNums[base] + rest * (sortedNums[base + 1] - sortedNums[base]);
-}
-
-function freqTop(values, topN = 5) {
-  const m = new Map();
-  for (const v of values) {
-    const key = String(v);
-    m.set(key, (m.get(key) || 0) + 1);
-  }
-  const arr = Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, topN);
-  return arr.map(([k, c]) => ({ value: k, count: c }));
-}
-
-function corrPearson(x, y) {
-  // x,y arrays of numbers with same length; may contain nulls
-  let n = 0;
-  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
-  for (let i = 0; i < x.length; i++) {
-    const xi = x[i], yi = y[i];
-    if (xi === null || yi === null) continue;
-    n++;
-    sx += xi; sy += yi;
-    sxx += xi * xi;
-    syy += yi * yi;
-    sxy += xi * yi;
-  }
-  if (n < 3) return null;
-  const cov = sxy - (sx * sy) / n;
-  const vx = sxx - (sx * sx) / n;
-  const vy = syy - (sy * sy) / n;
-  if (vx <= 0 || vy <= 0) return null;
-  return cov / Math.sqrt(vx * vy);
-}
-
-function buildCorrelationMatrix(rows, numericCols) {
-  const cols = numericCols;
-  const series = {};
-  for (const c of cols) {
-    series[c] = rows.map(r => safeNumber(r[c]));
-  }
-  const z = [];
-  for (let i = 0; i < cols.length; i++) {
-    const row = [];
-    for (let j = 0; j < cols.length; j++) {
-      const v = corrPearson(series[cols[i]], series[cols[j]]);
-      row.push(v === null ? null : Math.round(v * 1000) / 1000);
-    }
-    z.push(row);
-  }
-  return { cols, z };
-}
-
-function toCSV(rows, cols) {
-  const esc = (s) => {
-    const str = (s === null || s === undefined) ? "" : String(s);
-    if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
-    return str;
-  };
-  const header = cols.map(esc).join(",");
-  const lines = rows.map(r => cols.map(c => esc(r[c])).join(","));
-  return [header, ...lines].join("\n");
-}
-
-function downloadText(filename, text, mime = "text/plain") {
-  const blob = new Blob([text], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function getVisibleHeaders(sheetName, flags) {
-  const headers = state.sheets[sheetName]?.headers || [];
-  return headers.filter(h => !shouldHideColumn(h, flags));
-}
-
-function getDisplayRows(sheetName, flags) {
-  const rawRows = state.sheets[sheetName]?.rows || [];
-  const headers = getVisibleHeaders(sheetName, flags);
-  return rawRows.map(r => {
-    const o = {};
-    for (const h of headers) {
-      o[h] = applyMaskForDisplay(h, r[h], flags);
-    }
-    return o;
-  });
-}
-
-function computeSheetMissingRate(sheetName) {
-  const flags = getUIFlags();
-  const headers = getVisibleHeaders(sheetName, flags);
-  const rows = state.sheets[sheetName]?.rows || [];
-  if (rows.length === 0 || headers.length === 0) return 0;
-  let missing = 0;
-  const total = rows.length * headers.length;
-  for (const r of rows) {
-    for (const h of headers) {
-      if (isMissing(r[h])) missing++;
-    }
-  }
-  return missing / total;
-}
-
-function renderOverview() {
-  $("overviewEmpty").classList.add("d-none");
-  $("overviewContent").classList.remove("d-none");
-
-  const sheetCount = state.sheetOrder.length;
-  $("kpiSheetCount").textContent = sheetCount;
-
-  let totalRows = 0;
-  for (const s of state.sheetOrder) totalRows += (state.sheets[s].rows.length || 0);
-  $("kpiTotalRows").textContent = totalRows;
-
-  $("kpiDiagnosisRows").textContent = state.sheets["diagnosis"] ? state.sheets["diagnosis"].rows.length : "-";
-  $("kpiReferralEventsRows").textContent = state.sheets["referral_events"] ? state.sheets["referral_events"].rows.length : "-";
-
-  // Sheet summary table
-  const tbody = $("sheetSummaryTable").querySelector("tbody");
-  tbody.innerHTML = "";
-  for (const s of state.sheetOrder) {
-    const rows = state.sheets[s].rows.length;
-    const cols = state.sheets[s].headers.length;
-    const miss = computeSheetMissingRate(s);
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><a href="#" class="sheetLink" data-sheet="${s}">${s}</a></td>
-      <td class="text-end">${rows}</td>
-      <td class="text-end">${cols}</td>
-      <td class="text-end">${(miss * 100).toFixed(1)}%</td>
-    `;
-    tbody.appendChild(tr);
-  }
-  tbody.querySelectorAll(".sheetLink").forEach(a => {
-    a.addEventListener("click", (e) => {
-      e.preventDefault();
-      const name = e.currentTarget.getAttribute("data-sheet");
-      setCurrentSheet(name);
-      // switch tab
-      const tabEl = document.querySelector('#tab-sheet');
-      const tab = new bootstrap.Tab(tabEl);
-      tab.show();
-    });
-  });
-
-  renderInsights();
-  renderOverviewPlots();
-}
-
-function renderInsights() {
-  const el = $("insights");
-  const parts = [];
-
-  // diagnosis insights
-  if (state.sheets["diagnosis"]) {
-    const rows = state.sheets["diagnosis"].rows;
-    const headers = state.sheets["diagnosis"].headers;
-    const has = (c) => headers.includes(c);
-    parts.push(`<div class="mb-2"><span class="badge badge-soft me-1">diagnosis</span> ${rows.length.toLocaleString()}件</div>`);
-
-    if (has("email")) {
-      const uniq = new Set(rows.map(r => r["email"]).filter(v => !isMissing(v))).size;
-      parts.push(`<div class="mb-1">ユニークemail: <span class="fw-semibold">${uniq.toLocaleString()}</span></div>`);
-    }
-    if (has("createdAt")) {
-      const ds = rows.map(r => safeDate(r["createdAt"])).filter(d => d);
-      if (ds.length) {
-        ds.sort((a,b)=>a-b);
-        parts.push(`<div class="mb-1">期間: ${toISODateString(ds[0])} 〜 ${toISODateString(ds[ds.length-1])}</div>`);
-      }
-    }
-    if (has("interested")) {
-      const interested = rows.filter(r => String(r["interested"]) === "1" || r["interested"] === 1 || r["interested"] === true).length;
-      parts.push(`<div class="mb-1">interested=1: ${interested.toLocaleString()}件（${(interested/rows.length*100).toFixed(1)}%）</div>`);
-    }
-    if (has("age")) {
-      const ages = rows.map(r => safeNumber(r["age"])).filter(v => v !== null).sort((a,b)=>a-b);
-      if (ages.length) {
-        const p50 = median(ages);
-        parts.push(`<div class="mb-1">年齢（有効${ages.length.toLocaleString()}件）: 平均 ${(ages.reduce((a,b)=>a+b,0)/ages.length).toFixed(1)}, 中央 ${p50.toFixed(0)}</div>`);
-      }
-    }
-    if (has("gender")) {
-      const g = rows.map(r => r["gender"]).filter(v => !isMissing(v));
-      const top = freqTop(g, 5);
-      if (top.length) {
-        parts.push(`<div class="mb-1">gender上位: ${top.map(t => `${t.value}(${t.count})`).join(", ")}</div>`);
-      }
-    }
-  }
-
-  // referral insights
-  if (state.sheets["referral_events"]) {
-    const rows = state.sheets["referral_events"].rows;
-    const headers = state.sheets["referral_events"].headers;
-    const has = (c) => headers.includes(c);
-    parts.push(`<hr class="my-2" />`);
-    parts.push(`<div class="mb-2"><span class="badge badge-soft me-1">referral_events</span> ${rows.length.toLocaleString()}件</div>`);
-    if (has("eventType")) {
-      const top = freqTop(rows.map(r => r["eventType"]).filter(v => !isMissing(v)), 10);
-      parts.push(`<div class="mb-1">eventType: ${top.map(t => `${t.value}(${t.count})`).join(", ")}</div>`);
-    }
-  }
-
-  if (state.sheets["referrer_summary"]) {
-    const rows = state.sheets["referrer_summary"].rows;
-    const headers = state.sheets["referrer_summary"].headers;
-    const has = (c) => headers.includes(c);
-    parts.push(`<hr class="my-2" />`);
-    parts.push(`<div class="mb-2"><span class="badge badge-soft me-1">referrer_summary</span> ${rows.length.toLocaleString()} referrers</div>`);
-    if (has("unique_invited_completes")) {
-      const sorted = [...rows].sort((a,b) => (safeNumber(b["unique_invited_completes"])||0) - (safeNumber(a["unique_invited_completes"])||0));
-      const top = sorted.slice(0,3).map(r => `${r["referrerId"]}: ${safeNumber(r["unique_invited_completes"])||0}`);
-      if (top.length) parts.push(`<div class="mb-1">complete上位: ${top.join(", ")}</div>`);
-    }
-    if (has("visit_to_complete_rate")) {
-      const valid = rows.map(r => safeNumber(r["visit_to_complete_rate"])).filter(v => v !== null);
-      if (valid.length) {
-        valid.sort((a,b)=>a-b);
-        parts.push(`<div class="mb-1">visit→complete率: 中央 ${(median(valid)*100).toFixed(1)}%（有効${valid.length}）</div>`);
-      }
-    }
-  }
-
-  if (!parts.length) {
-    el.innerHTML = `<div class="text-muted">代表シートが見つかりません（汎用モードで探索してください）。</div>`;
-    return;
-  }
-  el.innerHTML = parts.join("");
-}
-
-function renderOverviewPlots() {
-  // diagnosis type top
-  if (state.sheets["diagnosis"] && state.sheets["diagnosis"].headers.includes("type")) {
-    const rows = state.sheets["diagnosis"].rows;
-    const values = rows.map(r => r["type"]).filter(v => !isMissing(v));
-    const top = freqTop(values, 12);
-    const x = top.map(t => t.value);
-    const y = top.map(t => t.count);
-    Plotly.newPlot("plotTypeTop", [{
-      type: "bar",
-      x, y
-    }], {
-      margin: {l: 40, r: 10, t: 10, b: 80},
-      xaxis: { tickangle: -45 }
-    }, {displayModeBar: false, responsive: true});
-  } else {
-    $("plotTypeTop").innerHTML = `<div class="text-muted small">diagnosis/type が見つかりません</div>`;
-  }
-
-  // events daily
-  if (state.sheets["events_daily"]) {
-    const rows = state.sheets["events_daily"].rows;
-    const dateCol = state.sheets["events_daily"].headers.includes("date") ? "date" : state.sheets["events_daily"].headers[0];
-    const x = rows.map(r => {
-      const d = safeDate(r[dateCol]);
-      return d ? toISODateString(d) : String(r[dateCol]);
-    });
-    const seriesCols = ["share", "referral_visit", "referral_complete"].filter(c => state.sheets["events_daily"].headers.includes(c));
-    const traces = seriesCols.map(c => ({
-      type: "scatter",
-      mode: "lines+markers",
-      name: c,
-      x,
-      y: rows.map(r => safeNumber(r[c]) || 0)
-    }));
-    Plotly.newPlot("plotEventsDaily", traces, {
-      margin: {l: 40, r: 10, t: 10, b: 40},
-      legend: {orientation: "h"}
-    }, {displayModeBar: false, responsive: true});
-  } else if (state.sheets["referral_events"] && state.sheets["referral_events"].headers.includes("timestamp") && state.sheets["referral_events"].headers.includes("eventType")) {
-    // derive daily counts from referral_events
-    const rows = state.sheets["referral_events"].rows;
-    const m = new Map(); // date -> {share, visit, complete}
-    for (const r of rows) {
-      const d = safeDate(r["timestamp"]);
-      if (!d) continue;
-      const day = toISODateString(d);
-      if (!m.has(day)) m.set(day, { share: 0, referral_visit: 0, referral_complete: 0 });
-      const obj = m.get(day);
-      const t = String(r["eventType"] || "");
-      if (t === "share") obj.share++;
-      if (t === "referral_visit") obj.referral_visit++;
-      if (t === "referral_complete") obj.referral_complete++;
-    }
-    const days = Array.from(m.keys()).sort();
-    const getSeries = (k) => days.map(d => m.get(d)[k] || 0);
-    const traces = [
-      {type:"scatter", mode:"lines+markers", name:"share", x: days, y: getSeries("share")},
-      {type:"scatter", mode:"lines+markers", name:"referral_visit", x: days, y: getSeries("referral_visit")},
-      {type:"scatter", mode:"lines+markers", name:"referral_complete", x: days, y: getSeries("referral_complete")},
-    ];
-    Plotly.newPlot("plotEventsDaily", traces, {
-      margin: {l: 40, r: 10, t: 10, b: 40},
-      legend: {orientation: "h"}
-    }, {displayModeBar: false, responsive: true});
-  } else {
-    $("plotEventsDaily").innerHTML = `<div class="text-muted small">events_daily か referral_events(timestamp/eventType) が見つかりません</div>`;
-  }
-
-  // Sankey
-  const visitsSheet = state.sheets["sankey_visits"] ? "sankey_visits" : (state.sheets["sankey_visits_acyclic"] ? "sankey_visits_acyclic" : null);
-  const completesSheet = state.sheets["sankey_completes"] ? "sankey_completes" : (state.sheets["sankey_completes_acyclic"] ? "sankey_completes_acyclic" : null);
-
-  if (visitsSheet) drawSankey("plotSankeyVisits", visitsSheet);
-  else $("plotSankeyVisits").innerHTML = `<div class="text-muted small">sankey_visits が見つかりません</div>`;
-
-  if (completesSheet) drawSankey("plotSankeyCompletes", completesSheet);
-  else $("plotSankeyCompletes").innerHTML = `<div class="text-muted small">sankey_completes が見つかりません</div>`;
-}
-
-function drawSankey(targetDivId, sheetName) {
-  const rows = state.sheets[sheetName].rows;
-  const headers = state.sheets[sheetName].headers;
-  if (!headers.includes("source") || !headers.includes("target") || !headers.includes("value")) {
-    $(targetDivId).innerHTML = `<div class="text-muted small">必要な列（source/target/value）がありません</div>`;
-    return;
-  }
-  const nodes = new Map(); // label->index
-  const addNode = (label) => {
-    const key = String(label);
-    if (!nodes.has(key)) nodes.set(key, nodes.size);
-    return nodes.get(key);
-  };
-  const src = [];
-  const tgt = [];
-  const val = [];
-  for (const r of rows) {
-    if (isMissing(r.source) || isMissing(r.target)) continue;
-    const s = addNode(r.source);
-    const t = addNode(r.target);
-    const v = safeNumber(r.value) || 0;
-    src.push(s); tgt.push(t); val.push(v);
-  }
-  const labels = Array.from(nodes.keys());
-  const data = [{
-    type: "sankey",
-    orientation: "h",
-    node: { label: labels, pad: 15, thickness: 15 },
-    link: { source: src, target: tgt, value: val }
-  }];
-  Plotly.newPlot(targetDivId, data, {
-    margin: {l: 10, r: 10, t: 10, b: 10},
-  }, {displayModeBar: false, responsive: true});
-}
-
-/**
- * ============================
- * Referral Deep Dive
- * ============================
- */
-
-function getReferralEventsAll() {
-  const sheet = state.sheets["referral_events"];
-  if (!sheet) return [];
-  const rows = sheet.rows || [];
-  const hasPayload = (sheet.headers || []).includes("payload_json");
-  const events = [];
-  for (const r of rows) {
-    const ts = safeDate(r["timestamp"] || r["createdAt"] || r["date"]);
-    if (!ts) continue;
-    const eventType = String(r["eventType"] || "").trim();
-    const payload = hasPayload ? parseJsonSafe(r["payload_json"]) : {};
-    const userId = r["userId"] || payload.userId || null;
-    const referrerId = r["referrerId"] || payload.referrerId || null;
-
-    events.push({
-      ts,
-      eventType,
-      userId,
-      referrerId,
-      platform: payload.platform || r["platform"] || null,
-      userType: payload.userType || r["userType"] || null,
-      userName: payload.userName || r["userName"] || null,
-      userEmail: payload.userEmail || r["userEmail"] || null,
-      gender: payload.gender || r["gender"] || null,
-    });
-  }
-  // sort by time
-  events.sort((a, b) => a.ts - b.ts);
-  return events;
-}
-
-function computeEventDateBounds(events) {
-  if (!events || events.length === 0) return { min: null, max: null };
-  return { min: events[0].ts, max: events[events.length - 1].ts };
-}
-
-function filterEventsByRange(events, startDate, endDate) {
-  // startDate/endDate: Date (local midnight). end is inclusive.
-  const endExcl = endDate ? addDays(endDate, 1) : null;
-  return (events || []).filter(e => {
-    if (startDate && e.ts < startDate) return false;
-    if (endExcl && e.ts >= endExcl) return false;
-    return true;
-  });
-}
-
-function buildEdgesFromEvents(eventsFiltered) {
-  // returns {edges:[], edgesByReferrer: Map}
-  const edgesMap = new Map(); // key = referrerId||userId
-  const keyOf = (rid, uid) => `${rid}||${uid}`;
-  for (const e of eventsFiltered) {
-    if (e.eventType !== "referral_visit" && e.eventType !== "referral_complete") continue;
-    if (!e.referrerId || !e.userId) continue;
-    const k = keyOf(e.referrerId, e.userId);
-    if (!edgesMap.has(k)) {
-      edgesMap.set(k, {
-        referrerId: e.referrerId,
-        userId: e.userId,
-        visits: 0,
-        completes: 0,
-        first_visit_at: null,
-        first_complete_at: null,
-        hours_to_complete: null,
-      });
-    }
-    const obj = edgesMap.get(k);
-    if (e.eventType === "referral_visit") {
-      obj.visits += 1;
-      if (!obj.first_visit_at || e.ts < obj.first_visit_at) obj.first_visit_at = e.ts;
-    }
-    if (e.eventType === "referral_complete") {
-      obj.completes += 1;
-      if (!obj.first_complete_at || e.ts < obj.first_complete_at) obj.first_complete_at = e.ts;
-    }
-  }
-
-  const edges = Array.from(edgesMap.values()).map(o => {
-    let hours = null;
-    if (o.first_visit_at && o.first_complete_at) {
-      hours = (o.first_complete_at.getTime() - o.first_visit_at.getTime()) / 3600000;
-      if (!Number.isFinite(hours)) hours = null;
-    }
-    return {
-      referrerId: o.referrerId,
-      userId: o.userId,
-      visits: o.visits,
-      completes: o.completes,
-      first_visit_at: o.first_visit_at ? o.first_visit_at.toISOString() : null,
-      first_complete_at: o.first_complete_at ? o.first_complete_at.toISOString() : null,
-      hours_to_complete: hours,
-    };
-  });
-
-  const byRef = new Map();
-  for (const e of edges) {
-    if (!byRef.has(e.referrerId)) byRef.set(e.referrerId, []);
-    byRef.get(e.referrerId).push(e);
-  }
-  for (const [rid, arr] of byRef.entries()) {
-    arr.sort((a, b) => (safeDate(a.first_visit_at) || 0) - (safeDate(b.first_visit_at) || 0));
-  }
-  return { edges, edgesByReferrer: byRef };
-}
-
-function buildUserInfoMap(eventsAll) {
-  const m = new Map(); // userId -> info
-  const upsert = (userId, patch) => {
-    if (!userId) return;
-    if (!m.has(userId)) m.set(userId, {});
-    const obj = m.get(userId);
-    for (const [k, v] of Object.entries(patch)) {
-      if (isMissing(v)) continue;
-      if (obj[k] === undefined || obj[k] === null || obj[k] === "") obj[k] = v;
+  // -----------------------------
+  // State
+  // -----------------------------
+  const state = {
+    file: null,
+    raw: {
+      diagnosis: [],
+      referral_events: []
+    },
+    norm: {
+      diagnosis: [],
+      referral_events: []
+    },
+    derived: {
+      diagnosisUsers: [],          // user-level summaries (latest record, favorite flags, etc.)
+      diagnosisUserIndex: new Map(), // emailLower -> user summary
+      refEvents: [],               // normalized referral events
+      refDaily: [],                // daily aggregates
+      referrerMeta: new Map(),     // referrerId -> meta
+      userMeta: new Map(),         // userId -> meta (from completes)
+      edges: {
+        visits: [],
+        completes: []
+      },
+      completeEmailToReferrer: new Map(), // emailLower -> {referrerId, ts}
+    },
+    ui: {
+      maskPII: true,
+      hideUnnamed: true
+    },
+    dt: {
+      tableDiagnosis: null,
+      tableFavorites: null,
+      tableRefEvents: null,
+      tableReferrers: null,
+      tableRefEdges: null,
+    },
+    selection: {
+      selectedReferrerId: null
     }
   };
 
-  for (const e of eventsAll) {
-    if (e.eventType === "share" && e.userId) {
-      upsert(e.userId, { userType: e.userType, gender: e.gender, userName: e.userName, userEmail: e.userEmail });
-    }
-    if (e.eventType === "referral_complete" && e.userId) {
-      // completing user's info (not necessarily needed, but can be useful)
-      upsert(e.userId, { userType: e.userType, gender: e.gender, userName: e.userName, userEmail: e.userEmail });
-    }
-  }
-  return m;
-}
+  // -----------------------------
+  // DOM helpers
+  // -----------------------------
+  const el = (id) => document.getElementById(id);
 
-function computeReferrerStats(eventsAll, eventsFiltered) {
-  const userInfo = buildUserInfoMap(eventsAll);
-
-  const stats = new Map(); // referrerId -> obj
-  const get = (rid) => {
-    if (!stats.has(rid)) {
-      const info = userInfo.get(rid) || {};
-      stats.set(rid, {
-        referrerId: rid,
-        referrerType: info.userType || null,
-        referrerGender: info.gender || null,
-
-        shares_total: 0,
-        shares_line: 0,
-        shares_twitter: 0,
-        shares_copy: 0,
-
-        visitors_set: new Set(),
-        completes_set: new Set(),
-
-        unique_invited_visitors: 0,
-        unique_invited_completes: 0,
-        visit_to_complete_rate: null,
-        avg_hours_to_complete: null,
-        median_hours_to_complete: null,
-      });
-    }
-    return stats.get(rid);
-  };
-
-  // from referrer_summary (optional): include referrers that might have 0 events in filtered window
-  if (state.sheets["referrer_summary"]) {
-    const rs = state.sheets["referrer_summary"].rows || [];
-    for (const r of rs) {
-      const rid = r["referrerId"];
-      if (isMissing(rid)) continue;
-      get(String(rid));
-    }
+  function setText(id, text) {
+    const node = el(id);
+    if (!node) return;
+    node.textContent = (text ?? '').toString();
   }
 
-  // aggregate filtered events
-  for (const e of eventsFiltered) {
-    if (e.eventType === "share" && e.userId) {
-      const s = get(String(e.userId));
-      s.shares_total += 1;
-      const p = String(e.platform || "").toLowerCase();
-      if (p === "line") s.shares_line += 1;
-      else if (p === "twitter") s.shares_twitter += 1;
-      else if (p === "copy") s.shares_copy += 1;
-    }
-    if (e.eventType === "referral_visit" && e.referrerId && e.userId) {
-      const s = get(String(e.referrerId));
-      s.visitors_set.add(String(e.userId));
-    }
-    if (e.eventType === "referral_complete" && e.referrerId && e.userId) {
-      const s = get(String(e.referrerId));
-      s.completes_set.add(String(e.userId));
-    }
+  function show(id) {
+    const node = el(id);
+    if (!node) return;
+    node.classList.remove('d-none');
   }
 
-  // edges + time-to-complete from filtered events
-  const { edges, edgesByReferrer } = buildEdgesFromEvents(eventsFiltered);
+  function hide(id) {
+    const node = el(id);
+    if (!node) return;
+    node.classList.add('d-none');
+  }
 
-  for (const [rid, s] of stats.entries()) {
-    s.unique_invited_visitors = s.visitors_set.size;
-    s.unique_invited_completes = s.completes_set.size;
-    s.visit_to_complete_rate = (s.unique_invited_visitors > 0) ? (s.unique_invited_completes / s.unique_invited_visitors) : null;
+  function escapeHtml(str) {
+    return (str ?? '').toString()
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
 
-    const hrs = (edgesByReferrer.get(rid) || [])
-      .map(e => e.hours_to_complete)
-      .filter(v => v !== null && v !== undefined && Number.isFinite(v))
-      .sort((a, b) => a - b);
-    if (hrs.length) {
-      s.avg_hours_to_complete = hrs.reduce((a, b) => a + b, 0) / hrs.length;
-      s.median_hours_to_complete = median(hrs);
-    } else {
-      s.avg_hours_to_complete = null;
-      s.median_hours_to_complete = null;
+  // -----------------------------
+  // Utility: dates, numbers, parsing
+  // -----------------------------
+  function isValidDate(d) {
+    return d instanceof Date && !Number.isNaN(d.getTime());
+  }
+
+  function parseISODate(s) {
+    if (!s) return null;
+    const d = new Date(s);
+    if (isValidDate(d)) return d;
+    return null;
+  }
+
+  function toISODateString(d) {
+    if (!d) return '';
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function clamp01(x) {
+    if (!Number.isFinite(x)) return 0;
+    return Math.max(0, Math.min(1, x));
+  }
+
+  function safeNumber(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function parseAgeToNumber(v) {
+    if (v === null || v === undefined) return null;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    const s = String(v).trim();
+    if (!s) return null;
+
+    // "23-25" => 24
+    const mRange = s.match(/^(\d{1,3})\s*-\s*(\d{1,3})$/);
+    if (mRange) {
+      const a = Number(mRange[1]);
+      const b = Number(mRange[2]);
+      if (Number.isFinite(a) && Number.isFinite(b)) return (a + b) / 2;
     }
 
-    // cleanup sets for display
-    delete s.visitors_set;
-    delete s.completes_set;
-  }
-
-  const list = Array.from(stats.values()).sort((a, b) => {
-    const ca = safeNumber(a.unique_invited_completes) || 0;
-    const cb = safeNumber(b.unique_invited_completes) || 0;
-    if (cb !== ca) return cb - ca;
-    const va = safeNumber(a.unique_invited_visitors) || 0;
-    const vb = safeNumber(b.unique_invited_visitors) || 0;
-    if (vb !== va) return vb - va;
-    const sa = safeNumber(a.shares_total) || 0;
-    const sb = safeNumber(b.shares_total) || 0;
-    return sb - sa;
-  });
-
-  return { list, edges, edgesByReferrer, userInfo };
-}
-
-function computeDailyEventCounts(eventsFiltered) {
-  const m = new Map(); // day -> {share, visit, complete}
-  for (const e of eventsFiltered) {
-    const day = toISODateString(e.ts);
-    if (!m.has(day)) m.set(day, { share: 0, referral_visit: 0, referral_complete: 0 });
-    const obj = m.get(day);
-    if (e.eventType === "share") obj.share += 1;
-    if (e.eventType === "referral_visit") obj.referral_visit += 1;
-    if (e.eventType === "referral_complete") obj.referral_complete += 1;
-  }
-  const days = Array.from(m.keys()).sort();
-  return { days, m };
-}
-
-function computeSharePlatformCounts(eventsFiltered) {
-  const m = new Map(); // platform -> count
-  for (const e of eventsFiltered) {
-    if (e.eventType !== "share") continue;
-    const p = String(e.platform || "unknown");
-    m.set(p, (m.get(p) || 0) + 1);
-  }
-  const arr = Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
-  return arr;
-}
-
-function computeTypePerformance(referrerStatsList) {
-  // returns [{type, referrers, shares, visitors, completes, v2c_rate, avg_hours}]
-  const m = new Map();
-  for (const r of referrerStatsList) {
-    const t = r.referrerType ? String(r.referrerType) : "unknown";
-    if (!m.has(t)) m.set(t, { type: t, referrers: 0, shares: 0, visitors: 0, completes: 0, hours: [] });
-    const o = m.get(t);
-    o.referrers += 1;
-    o.shares += safeNumber(r.shares_total) || 0;
-    o.visitors += safeNumber(r.unique_invited_visitors) || 0;
-    o.completes += safeNumber(r.unique_invited_completes) || 0;
-    if (r.avg_hours_to_complete !== null && r.avg_hours_to_complete !== undefined && Number.isFinite(r.avg_hours_to_complete)) {
-      o.hours.push(r.avg_hours_to_complete);
-    }
-  }
-  const out = Array.from(m.values()).map(o => {
-    const v2c = o.visitors > 0 ? o.completes / o.visitors : null;
-    const avgH = o.hours.length ? (o.hours.reduce((a, b) => a + b, 0) / o.hours.length) : null;
-    return { type: o.type, referrers: o.referrers, shares: o.shares, visitors: o.visitors, completes: o.completes, v2c_rate: v2c, avg_hours: avgH };
-  }).sort((a, b) => (safeNumber(b.completes) || 0) - (safeNumber(a.completes) || 0));
-  return out;
-}
-
-function computeReferralDiagnosisJoin(eventsFiltered, startDate, endDate) {
-  // Join referral_complete(payload.userEmail) with diagnosis.email
-  const diagSheet = state.sheets["diagnosis"];
-  if (!diagSheet) return null;
-  const headers = diagSheet.headers || [];
-  if (!headers.includes("email")) return null;
-
-  const hasCreatedAt = headers.includes("createdAt");
-  const hasType = headers.includes("type");
-  const hasInterested = headers.includes("interested");
-
-  const endExcl = endDate ? addDays(endDate, 1) : null;
-
-  // Build latest diagnosis row per email (within period if createdAt exists)
-  const latestByEmail = new Map(); // email -> {createdAt, type, interested}
-  for (const r of (diagSheet.rows || [])) {
-    const email = r["email"];
-    if (isMissing(email)) continue;
-    const em = String(email).trim();
-    if (!em) continue;
-
-    let d = hasCreatedAt ? safeDate(r["createdAt"]) : new Date(0);
-    if (hasCreatedAt) {
-      if (!d) continue;
-      if (startDate && d < startDate) continue;
-      if (endExcl && d >= endExcl) continue;
+    // "26+" => 26
+    const mPlus = s.match(/^(\d{1,3})\s*\+$/);
+    if (mPlus) {
+      const a = Number(mPlus[1]);
+      if (Number.isFinite(a)) return a;
     }
 
-    const prev = latestByEmail.get(em);
-    if (!prev || (d && prev.createdAt && d > prev.createdAt)) {
-      latestByEmail.set(em, {
-        email: em,
-        createdAt: d,
-        type: hasType ? (isMissing(r["type"]) ? null : String(r["type"])) : null,
-        interested: hasInterested ? r["interested"] : null,
-      });
+    // plain integer
+    const mInt = s.match(/^(\d{1,3})$/);
+    if (mInt) {
+      const a = Number(mInt[1]);
+      if (Number.isFinite(a)) return a;
+    }
+
+    return null;
+  }
+
+  function parseJsonSafe(s) {
+    if (s === null || s === undefined) return null;
+    if (typeof s === 'object') return s;
+    const str = String(s);
+    if (!str) return null;
+    try {
+      return JSON.parse(str);
+    } catch (e) {
+      return null;
     }
   }
 
-  // Referred (unique emails) from referral_complete in the filtered period
-  const referredEmails = new Set();
-  for (const e of (eventsFiltered || [])) {
-    if (e.eventType !== "referral_complete") continue;
-    if (isMissing(e.userEmail)) continue;
-    const em = String(e.userEmail).trim();
-    if (!em) continue;
-    referredEmails.add(em);
+  function shortHash(str) {
+    // deterministic, simple hash -> base36
+    const s = (str ?? '').toString();
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) + h) + s.charCodeAt(i); // djb2
+      h = h >>> 0;
+    }
+    return h.toString(36).padStart(6, '0');
   }
 
-  const matched = [];
-  for (const em of referredEmails) {
-    const row = latestByEmail.get(em);
-    if (row) matched.push(row);
+  function maskId(kind, raw) {
+    if (!raw) return '';
+    return `${kind}_${shortHash(raw)}`;
   }
 
-  const overallRows = Array.from(latestByEmail.values());
+  function normalizeGender(g) {
+    const s = (g ?? '').toString().trim().toLowerCase();
+    if (s === 'female' || s === 'f') return 'female';
+    if (s === 'male' || s === 'm') return 'male';
+    if (!s) return 'unknown';
+    return s; // keep other labels
+  }
 
-  const countTypes = (rows) => {
+  function normalizeType(t) {
+    const s = (t ?? '').toString().trim();
+    return s || '(unknown)';
+  }
+
+  function normalizeEmail(e) {
+    const s = (e ?? '').toString().trim().toLowerCase();
+    return s || null;
+  }
+
+  function formatPct(x) {
+    if (!Number.isFinite(x)) return '—';
+    return `${(x * 100).toFixed(1)}%`;
+  }
+
+  function mean(arr) {
+    const xs = arr.filter(x => Number.isFinite(x));
+    if (!xs.length) return null;
+    const s = xs.reduce((a, b) => a + b, 0);
+    return s / xs.length;
+  }
+
+  function median(arr) {
+    const xs = arr.filter(x => Number.isFinite(x)).sort((a, b) => a - b);
+    if (!xs.length) return null;
+    const mid = Math.floor(xs.length / 2);
+    if (xs.length % 2 === 1) return xs[mid];
+    return (xs[mid - 1] + xs[mid]) / 2;
+  }
+
+  function std(arr) {
+    const xs = arr.filter(x => Number.isFinite(x));
+    if (xs.length < 2) return null;
+    const m = mean(xs);
+    const v = xs.reduce((acc, x) => acc + (x - m) ** 2, 0) / (xs.length - 1);
+    return Math.sqrt(v);
+  }
+
+  function cohenD(a, b) {
+    const xs = a.filter(x => Number.isFinite(x));
+    const ys = b.filter(x => Number.isFinite(x));
+    if (xs.length < 2 || ys.length < 2) return null;
+    const mx = mean(xs);
+    const my = mean(ys);
+    const sx = std(xs);
+    const sy = std(ys);
+    if (!Number.isFinite(sx) || !Number.isFinite(sy)) return null;
+    const sp = Math.sqrt(((xs.length - 1) * sx * sx + (ys.length - 1) * sy * sy) / (xs.length + ys.length - 2));
+    if (!Number.isFinite(sp) || sp === 0) return null;
+    return (mx - my) / sp;
+  }
+
+  function pearson(x, y) {
+    const pairs = [];
+    for (let i = 0; i < x.length; i++) {
+      const a = x[i];
+      const b = y[i];
+      if (Number.isFinite(a) && Number.isFinite(b)) pairs.push([a, b]);
+    }
+    if (pairs.length < 3) return null;
+    const xs = pairs.map(p => p[0]);
+    const ys = pairs.map(p => p[1]);
+    const mx = mean(xs);
+    const my = mean(ys);
+    const sx = std(xs);
+    const sy = std(ys);
+    if (!sx || !sy) return null;
+    let cov = 0;
+    for (let i = 0; i < pairs.length; i++) cov += (pairs[i][0] - mx) * (pairs[i][1] - my);
+    cov = cov / (pairs.length - 1);
+    return cov / (sx * sy);
+  }
+
+  function groupCount(arr, keyFn) {
     const m = new Map();
-    for (const r of rows) {
-      const t = r.type || "unknown";
-      m.set(t, (m.get(t) || 0) + 1);
+    for (const item of arr) {
+      const k = keyFn(item);
+      m.set(k, (m.get(k) ?? 0) + 1);
     }
     return m;
-  };
-
-  const isInterested = (v) => {
-    return String(v) === "1" || v === 1 || v === true;
-  };
-
-  let refInterested = 0;
-  for (const r of matched) if (isInterested(r.interested)) refInterested++;
-
-  let allInterested = 0;
-  for (const r of overallRows) if (isInterested(r.interested)) allInterested++;
-
-  const refRate = matched.length ? (refInterested / matched.length) : null;
-  const allRate = overallRows.length ? (allInterested / overallRows.length) : null;
-
-  return {
-    referred_unique_emails: referredEmails.size,
-    matched_unique_emails: matched.length,
-    refRate,
-    allRate,
-    refType: countTypes(matched),
-    allType: countTypes(overallRows),
-  };
-}
-
-function renderReferralDiagnosisJoin(join) {
-  const el1 = $("kpiReferredUniqueEmail");
-  const el2 = $("kpiReferredMatched");
-  const el3 = $("kpiReferredInterested");
-  const plotId = "plotReferredTypeCompare";
-
-  if (!el1 || !el2 || !el3 || !$(plotId)) return;
-
-  if (!join) {
-    el1.textContent = "-";
-    el2.textContent = "-";
-    el3.textContent = "-";
-    $(plotId).innerHTML = `<div class="text-muted small">diagnosis（email/type/createdAt）が無いので突合できません</div>`;
-    return;
   }
 
-  el1.textContent = formatInt(join.referred_unique_emails);
-  el2.textContent = formatInt(join.matched_unique_emails);
-
-  const a = (join.refRate === null) ? "-" : formatPct(join.refRate, 1);
-  const b = (join.allRate === null) ? "-" : formatPct(join.allRate, 1);
-  el3.textContent = `${a} / ${b}`;
-
-  // Build union of types: top overall + all referred
-  const allCounts = {};
-  for (const [k, v] of join.allType.entries()) allCounts[k] = v;
-  const refCounts = {};
-  for (const [k, v] of join.refType.entries()) refCounts[k] = v;
-
-  const topAll = Object.entries(allCounts).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([t]) => t);
-  const typesSet = new Set(topAll);
-  Object.keys(refCounts).forEach(t => typesSet.add(t));
-
-  const x = Array.from(typesSet);
-  x.sort((a, b) => (allCounts[b] || 0) - (allCounts[a] || 0));
-
-  Plotly.newPlot(plotId, [
-    { type: "bar", name: "referred_complete", x, y: x.map(t => refCounts[t] || 0) },
-    { type: "bar", name: "all_diagnosis", x, y: x.map(t => allCounts[t] || 0) },
-  ], {
-    margin: { l: 40, r: 10, t: 10, b: 120 },
-    barmode: "group",
-    xaxis: { tickangle: -45 },
-    yaxis: { title: "users (unique email)" },
-    legend: { orientation: "h" },
-  }, { displayModeBar: false, responsive: true });
-}
-
-function renderReferralDeepDive() {
-  const empty = $("referralEmpty");
-  const content = $("referralContent");
-  if (!empty || !content) return;
-
-  if (!state.workbook) {
-    empty.classList.remove("d-none");
-    content.classList.add("d-none");
-    return;
+  function uniqueCount(arr, keyFn) {
+    const s = new Set();
+    for (const item of arr) s.add(keyFn(item));
+    return s.size;
   }
 
-  if (!state.sheets["referral_events"]) {
-    empty.classList.remove("d-none");
-    empty.innerHTML = `紹介系シート（referral_events）が見つかりません。<br/>「シート探索」タブで利用可能なシートを確認してください。`;
-    content.classList.add("d-none");
-    return;
+  function downloadText(filename, text, mime = 'text/plain;charset=utf-8') {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
-  // Base events
-  const eventsAll = getReferralEventsAll();
-  const bounds = computeEventDateBounds(eventsAll);
-
-  empty.classList.add("d-none");
-  content.classList.remove("d-none");
-
-  // Init date inputs (only if empty)
-  const startInput = $("refStartDate");
-  const endInput = $("refEndDate");
-  if (bounds.min && bounds.max) {
-    const minStr = toISODateString(bounds.min);
-    const maxStr = toISODateString(bounds.max);
-    if (startInput && !startInput.value) startInput.value = minStr;
-    if (endInput && !endInput.value) endInput.value = maxStr;
-  }
-
-  // filter
-  let start = startInput ? parseDateInput(startInput.value) : null;
-  let end = endInput ? parseDateInput(endInput.value) : null;
-  if (start && end && start > end) {
-    // swap
-    const tmp = start; start = end; end = tmp;
-    if (startInput) startInput.value = toISODateString(start);
-    if (endInput) endInput.value = toISODateString(end);
-  }
-
-  const eventsFiltered = filterEventsByRange(eventsAll, start, end);
-
-  // compute
-  const { list: referrerStats, edges, edgesByReferrer } = computeReferrerStats(eventsAll, eventsFiltered);
-  const daily = computeDailyEventCounts(eventsFiltered);
-  const platformCounts = computeSharePlatformCounts(eventsFiltered);
-  const typePerf = computeTypePerformance(referrerStats);
-
-  state.referralDerived = {
-    bounds,
-    start,
-    end,
-    eventsAll,
-    eventsFiltered,
-    referrerStats,
-    edges,
-    edgesByReferrer,
-    daily,
-    platformCounts,
-    typePerf,
-  };
-
-  // Hint
-  const hint = $("refFilterHint");
-  if (hint) {
-    const a = start ? toISODateString(start) : "-";
-    const b = end ? toISODateString(end) : "-";
-    const total = eventsAll.length;
-    const filtered = eventsFiltered.length;
-    hint.textContent = `対象期間: ${a} 〜 ${b} / events: ${filtered.toLocaleString()}（全${total.toLocaleString()}）`;
-  }
-
-  // KPI
-  const shares = eventsFiltered.filter(e => e.eventType === "share").length;
-  const visits = eventsFiltered.filter(e => e.eventType === "referral_visit").length;
-  const completes = eventsFiltered.filter(e => e.eventType === "referral_complete").length;
-  $("kpiRefShare").textContent = formatInt(shares);
-  $("kpiRefVisit").textContent = formatInt(visits);
-  $("kpiRefComplete").textContent = formatInt(completes);
-  $("kpiRefRateSV").textContent = shares > 0 ? formatPct(visits / shares, 1) : "-";
-  $("kpiRefRateVC").textContent = visits > 0 ? formatPct(completes / visits, 1) : "-";
-  $("kpiRefRateSC").textContent = shares > 0 ? formatPct(completes / shares, 1) : "-";
-
-  // plots
-  renderReferralPlots();
-
-  // referral_complete × diagnosis join
-  const join = computeReferralDiagnosisJoin(eventsFiltered, start, end);
-  state.referralDerived.join = join;
-  renderReferralDiagnosisJoin(join);
-
-  // leaderboard table
-  renderReferrerTable();
-
-  // populate referrer select + details
-  populateReferrerSelect();
-  renderReferrerDetail();
-
-  // sankey
-  drawReferralSankey();
-}
-
-function renderReferralPlots() {
-  const d = state.referralDerived;
-  if (!d) return;
-
-  // time series
-  const days = d.daily.days;
-  const getSeries = (k) => days.map(day => d.daily.m.get(day)[k] || 0);
-  if (days.length) {
-    Plotly.newPlot("plotRefTimeSeries", [
-      { type: "scatter", mode: "lines+markers", name: "share", x: days, y: getSeries("share") },
-      { type: "scatter", mode: "lines+markers", name: "referral_visit", x: days, y: getSeries("referral_visit") },
-      { type: "scatter", mode: "lines+markers", name: "referral_complete", x: days, y: getSeries("referral_complete") },
-    ], {
-      margin: { l: 40, r: 10, t: 10, b: 40 },
-      legend: { orientation: "h" }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotRefTimeSeries").innerHTML = `<div class="text-muted small">対象期間にイベントがありません</div>`;
-  }
-
-  // platform
-  if (d.platformCounts.length) {
-    const x = d.platformCounts.map(([p]) => p);
-    const y = d.platformCounts.map(([, c]) => c);
-    Plotly.newPlot("plotSharePlatform", [{
-      type: "bar", x, y
-    }], {
-      margin: { l: 40, r: 10, t: 10, b: 80 },
-      xaxis: { tickangle: -30 }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotSharePlatform").innerHTML = `<div class="text-muted small">shareイベントがありません</div>`;
-  }
-
-  // type performance (v2c rate)
-  if (d.typePerf.length) {
-    const top = d.typePerf.slice(0, 20);
-    const x = top.map(o => o.type);
-    const y = top.map(o => o.v2c_rate === null ? 0 : o.v2c_rate);
-    const text = top.map(o => `referrers=${o.referrers}, visitors=${o.visitors}, completes=${o.completes}`);
-    Plotly.newPlot("plotTypePerformance", [{
-      type: "bar",
-      x, y,
-      text,
-      hovertemplate: "%{x}<br>visit→complete=%{y:.2%}<br>%{text}<extra></extra>"
-    }], {
-      margin: { l: 50, r: 10, t: 10, b: 120 },
-      yaxis: { tickformat: ".0%" },
-      xaxis: { tickangle: -45 }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotTypePerformance").innerHTML = `<div class="text-muted small">type情報が不足しています</div>`;
-  }
-
-  // scatter visitors vs completes
-  const flags = getUIFlags();
-  if (d.referrerStats.length) {
-    const xs = d.referrerStats.map(r => safeNumber(r.unique_invited_visitors) || 0);
-    const ys = d.referrerStats.map(r => safeNumber(r.unique_invited_completes) || 0);
-    const sizes = d.referrerStats.map(r => Math.max(6, Math.sqrt(safeNumber(r.shares_total) || 0) * 6));
-    const labels = d.referrerStats.map(r => {
-      const id = flags.maskPII ? maskIdLike(r.referrerId) : r.referrerId;
-      const t = r.referrerType ? ` / ${r.referrerType}` : "";
-      return id + t;
-    });
-    Plotly.newPlot("plotRefScatter", [{
-      type: "scatter",
-      mode: "markers",
-      x: xs,
-      y: ys,
-      text: labels,
-      marker: { size: sizes, sizemode: "area", opacity: 0.75 },
-      hovertemplate: "%{text}<br>visitors=%{x}<br>completes=%{y}<extra></extra>"
-    }], {
-      margin: { l: 50, r: 10, t: 10, b: 40 },
-      xaxis: { title: "unique invited visitors" },
-      yaxis: { title: "unique invited completes" }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotRefScatter").innerHTML = `<div class="text-muted small">referrerがいません</div>`;
-  }
-}
-
-function renderReferrerTable() {
-  const d = state.referralDerived;
-  if (!d) return;
-  const flags = getUIFlags();
-
-  const table = $("referrerTable");
-  if (!table) return;
-
-  const cols = [
-    "referrerId",
-    "referrerType",
-    "shares_total",
-    "shares_line",
-    "shares_copy",
-    "shares_twitter",
-    "unique_invited_visitors",
-    "unique_invited_completes",
-    "visit_to_complete_rate",
-    "avg_hours_to_complete",
-  ];
-
-  // build thead/tbody
-  const thead = table.querySelector("thead");
-  const tbody = table.querySelector("tbody");
-  thead.innerHTML = "";
-  tbody.innerHTML = "";
-
-  const trh = document.createElement("tr");
-  for (const c of cols) {
-    const th = document.createElement("th");
-    th.textContent = c;
-    trh.appendChild(th);
-  }
-  thead.appendChild(trh);
-
-  for (const r of d.referrerStats) {
-    const tr = document.createElement("tr");
-    tr.setAttribute("data-referrer-id", r.referrerId);
-
-    for (const c of cols) {
-      const td = document.createElement("td");
-      let v = r[c];
-
-      if (c === "referrerId") v = flags.maskPII ? maskIdLike(v) : v;
-      if (c === "visit_to_complete_rate") v = (v === null ? "" : formatPct(v, 1));
-      if (c === "avg_hours_to_complete") v = (v === null ? "" : formatHours(v, 2));
-      if (["shares_total","shares_line","shares_copy","shares_twitter","unique_invited_visitors","unique_invited_completes"].includes(c)) v = formatInt(v);
-
-      td.textContent = isMissing(v) ? "" : String(v);
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  }
-
-  if (state.referrerTable) {
-    try { state.referrerTable.destroy(); } catch(e) {}
-    state.referrerTable = null;
-  }
-  state.referrerTable = new DataTable(table, {
-    paging: true,
-    pageLength: 25,
-    searching: true,
-    info: true,
-    responsive: true,
-    order: [[7, "desc"]],
-  });
-}
-
-function populateReferrerSelect() {
-  const d = state.referralDerived;
-  if (!d) return;
-  const flags = getUIFlags();
-  const sel = $("referrerSelect");
-  if (!sel) return;
-
-  const prev = state.referralSelectedReferrer;
-
-  sel.innerHTML = "";
-  for (const r of d.referrerStats) {
-    const opt = document.createElement("option");
-    opt.value = r.referrerId;
-    const id = flags.maskPII ? maskIdLike(r.referrerId) : r.referrerId;
-    const t = r.referrerType ? ` / ${r.referrerType}` : "";
-    const c = safeNumber(r.unique_invited_completes) || 0;
-    opt.textContent = `${id}${t} (complete=${c})`;
-    sel.appendChild(opt);
-  }
-
-  // choose selection
-  if (prev && d.referrerStats.some(r => r.referrerId === prev)) {
-    sel.value = prev;
-    state.referralSelectedReferrer = prev;
-  } else {
-    const first = d.referrerStats[0]?.referrerId || null;
-    if (first) {
-      sel.value = first;
-      state.referralSelectedReferrer = first;
-    }
-  }
-}
-
-function renderReferrerDetail() {
-  const d = state.referralDerived;
-  if (!d) return;
-
-  const sel = $("referrerSelect");
-  if (!sel) return;
-
-  const rid = state.referralSelectedReferrer || sel.value;
-  if (!rid) return;
-  state.referralSelectedReferrer = rid;
-  sel.value = rid;
-
-  const flags = getUIFlags();
-
-  const stats = d.referrerStats.find(r => r.referrerId === rid);
-  const edges = d.edgesByReferrer.get(rid) || [];
-  const events = d.eventsFiltered.filter(e => e.userId === rid || e.referrerId === rid);
-
-  // KPI cards
-  const kpi = $("referrerDetailKpis");
-  if (kpi) {
-    const idDisp = flags.maskPII ? maskIdLike(rid) : rid;
-    const typeDisp = stats?.referrerType ? String(stats.referrerType) : "-";
-    const share = stats ? stats.shares_total : 0;
-    const vis = stats ? stats.unique_invited_visitors : 0;
-    const comp = stats ? stats.unique_invited_completes : 0;
-    const v2c = stats ? stats.visit_to_complete_rate : null;
-    const avgH = stats ? stats.avg_hours_to_complete : null;
-    const medH = stats ? stats.median_hours_to_complete : null;
-
-    kpi.innerHTML = `
-      <div class="col-md-3"><div class="card h-100"><div class="card-body">
-        <div class="small text-muted">referrer</div><div class="h5 mb-0">${idDisp}</div>
-        <div class="small text-muted mt-1">type: ${typeDisp}</div>
-      </div></div></div>
-      <div class="col-md-3"><div class="card h-100"><div class="card-body">
-        <div class="small text-muted">shares</div><div class="h5 mb-0">${formatInt(share)}</div>
-      </div></div></div>
-      <div class="col-md-3"><div class="card h-100"><div class="card-body">
-        <div class="small text-muted">visitors / completes</div><div class="h5 mb-0">${formatInt(vis)} / ${formatInt(comp)}</div>
-        <div class="small text-muted mt-1">visit→complete: ${v2c === null ? "-" : formatPct(v2c, 1)}</div>
-      </div></div></div>
-      <div class="col-md-3"><div class="card h-100"><div class="card-body">
-        <div class="small text-muted">hours to complete</div><div class="h5 mb-0">${avgH === null ? "-" : formatHours(avgH, 2)}</div>
-        <div class="small text-muted mt-1">median: ${medH === null ? "-" : formatHours(medH, 2)}</div>
-      </div></div></div>
-    `;
-  }
-
-  // timeline: daily counts for this referrer (share/visit/complete)
-  const m = new Map();
-  for (const e of events) {
-    const day = toISODateString(e.ts);
-    if (!m.has(day)) m.set(day, { share: 0, referral_visit: 0, referral_complete: 0 });
-    const obj = m.get(day);
-    if (e.eventType === "share" && e.userId === rid) obj.share += 1;
-    if (e.eventType === "referral_visit" && e.referrerId === rid) obj.referral_visit += 1;
-    if (e.eventType === "referral_complete" && e.referrerId === rid) obj.referral_complete += 1;
-  }
-  const days = Array.from(m.keys()).sort();
-  if (days.length) {
-    Plotly.newPlot("plotReferrerTimeline", [
-      { type: "scatter", mode: "lines+markers", name: "share", x: days, y: days.map(dy => m.get(dy).share) },
-      { type: "scatter", mode: "lines+markers", name: "referral_visit", x: days, y: days.map(dy => m.get(dy).referral_visit) },
-      { type: "scatter", mode: "lines+markers", name: "referral_complete", x: days, y: days.map(dy => m.get(dy).referral_complete) },
-    ], {
-      margin: { l: 40, r: 10, t: 10, b: 40 },
-      legend: { orientation: "h" }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotReferrerTimeline").innerHTML = `<div class="text-muted small">対象期間にイベントがありません</div>`;
-  }
-
-  // hours histogram
-  const hrs = edges.map(e => e.hours_to_complete).filter(v => v !== null && v !== undefined && Number.isFinite(v));
-  if (hrs.length) {
-    Plotly.newPlot("plotHoursToComplete", [{
-      type: "histogram",
-      x: hrs,
-      nbinsx: Math.min(40, Math.max(10, Math.round(Math.sqrt(hrs.length))))
-    }], {
-      margin: { l: 50, r: 10, t: 10, b: 40 },
-      xaxis: { title: "hours_to_complete" },
-      yaxis: { title: "count" }
-    }, { displayModeBar: false, responsive: true });
-  } else {
-    $("plotHoursToComplete").innerHTML = `<div class="text-muted small">completeがありません</div>`;
-  }
-
-  // edges table
-  renderRefEdgesTable(edges);
-}
-
-function renderRefEdgesTable(edges) {
-  const flags = getUIFlags();
-  const table = $("refEdgesTable");
-  if (!table) return;
-
-  const cols = ["userId", "visits", "completes", "first_visit_at", "first_complete_at", "hours_to_complete"];
-
-  const thead = table.querySelector("thead");
-  const tbody = table.querySelector("tbody");
-  thead.innerHTML = "";
-  tbody.innerHTML = "";
-
-  const trh = document.createElement("tr");
-  for (const c of cols) {
-    const th = document.createElement("th");
-    th.textContent = c;
-    trh.appendChild(th);
-  }
-  thead.appendChild(trh);
-
-  for (const e of edges) {
-    const tr = document.createElement("tr");
-    for (const c of cols) {
-      const td = document.createElement("td");
-      let v = e[c];
-
-      if (c === "userId") v = flags.maskPII ? maskIdLike(v) : v;
-      if (c === "first_visit_at" || c === "first_complete_at") {
-        const d = safeDate(v);
-        v = d ? d.toISOString().replace("T", " ").slice(0, 19) : "";
-      }
-      if (c === "hours_to_complete") v = (v === null ? "" : formatHours(v, 2));
-      if (c === "visits" || c === "completes") v = formatInt(v);
-
-      td.textContent = isMissing(v) ? "" : String(v);
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  }
-
-  if (state.refEdgesTable) {
-    try { state.refEdgesTable.destroy(); } catch(e) {}
-    state.refEdgesTable = null;
-  }
-  state.refEdgesTable = new DataTable(table, {
-    paging: true,
-    pageLength: 25,
-    searching: true,
-    info: true,
-    responsive: true,
-    order: [[5, "asc"]],
-  });
-}
-
-function pickSankeySheet(kind, variant) {
-  // returns sheetName or null
-  if (kind === "visits") {
-    const ac = state.sheets["sankey_visits_acyclic"] ? "sankey_visits_acyclic" : null;
-    const raw = state.sheets["sankey_visits"] ? "sankey_visits" : null;
-    if (variant === "raw") return raw || ac;
-    return ac || raw;
-  }
-  if (kind === "completes") {
-    const ac = state.sheets["sankey_completes_acyclic"] ? "sankey_completes_acyclic" : null;
-    const raw = state.sheets["sankey_completes"] ? "sankey_completes" : null;
-    if (variant === "raw") return raw || ac;
-    return ac || raw;
-  }
-  return null;
-}
-
-function drawReferralSankey() {
-  const kindSel = $("refSankeyKind");
-  const varSel = $("refSankeyVariant");
-  const minEl = $("refSankeyMinValue");
-  if (!kindSel || !varSel || !minEl) return;
-
-  const kind = kindSel.value;
-  const variant = varSel.value;
-  const sheetName = pickSankeySheet(kind, variant);
-
-  if (!sheetName) {
-    $("plotReferralSankey").innerHTML = `<div class="text-muted small">Sankey用のシート（${kind}）が見つかりません</div>`;
-    const st = $("refNetworkStats");
-    if (st) st.textContent = "-";
-    return;
-  }
-
-  const minValue = safeNumber(minEl.value) || 0;
-  drawSankeyFiltered("plotReferralSankey", sheetName, minValue);
-
-  // stats
-  const stats = computeNetworkStatsFromSankeySheet(sheetName, minValue);
-  const st = $("refNetworkStats");
-  if (st) {
-    if (!stats) {
-      st.textContent = "-";
-    } else {
-      const depth = (stats.longestPathLength === null) ? "n/a" : String(stats.longestPathLength);
-      st.textContent = `sheet=${sheetName} / nodes=${stats.nodes} / edges=${stats.edges} / depth(max edges)=${depth} / max outdegree=${stats.maxOutdegree}`;
-    }
-  }
-}
-
-function drawSankeyFiltered(targetDivId, sheetName, minValue = 0) {
-  const rows = state.sheets[sheetName].rows;
-  const headers = state.sheets[sheetName].headers;
-  if (!headers.includes("source") || !headers.includes("target") || !headers.includes("value")) {
-    $(targetDivId).innerHTML = `<div class="text-muted small">必要な列（source/target/value）がありません</div>`;
-    return;
-  }
-  const nodes = new Map(); // label->index
-  const addNode = (label) => {
-    const key = String(label);
-    if (!nodes.has(key)) nodes.set(key, nodes.size);
-    return nodes.get(key);
-  };
-  const src = [];
-  const tgt = [];
-  const val = [];
-  for (const r of rows) {
-    if (isMissing(r.source) || isMissing(r.target)) continue;
-    const v = safeNumber(r.value) || 0;
-    if (v < minValue) continue;
-    const s = addNode(r.source);
-    const t = addNode(r.target);
-    src.push(s); tgt.push(t); val.push(v);
-  }
-  const labels = Array.from(nodes.keys());
-  const data = [{
-    type: "sankey",
-    orientation: "h",
-    node: { label: labels, pad: 15, thickness: 15 },
-    link: { source: src, target: tgt, value: val }
-  }];
-  Plotly.newPlot(targetDivId, data, {
-    margin: { l: 10, r: 10, t: 10, b: 10 },
-  }, { displayModeBar: false, responsive: true });
-}
-
-function computeNetworkStatsFromSankeySheet(sheetName, minValue = 0) {
-  const sheet = state.sheets[sheetName];
-  if (!sheet) return null;
-  const rows = sheet.rows || [];
-  const edges = [];
-  const nodesSet = new Set();
-  const outdeg = new Map();
-
-  for (const r of rows) {
-    if (isMissing(r.source) || isMissing(r.target)) continue;
-    const v = safeNumber(r.value) || 0;
-    if (v < minValue) continue;
-    const s = String(r.source);
-    const t = String(r.target);
-    edges.push([s, t]);
-    nodesSet.add(s); nodesSet.add(t);
-    outdeg.set(s, (outdeg.get(s) || 0) + 1);
-  }
-
-  const nodes = Array.from(nodesSet);
-  const maxOutdegree = nodes.reduce((mx, n) => Math.max(mx, outdeg.get(n) || 0), 0);
-
-  // longest path (only if DAG)
-  const longest = dagLongestPathLength(nodes, edges);
-
-  return { nodes: nodes.length, edges: edges.length, maxOutdegree, longestPathLength: longest };
-}
-
-function dagLongestPathLength(nodes, edges) {
-  // edges: array of [s,t]. returns length in edges, or null if cycle.
-  const indeg = new Map();
-  const adj = new Map();
-  for (const n of nodes) { indeg.set(n, 0); adj.set(n, []); }
-  for (const [s, t] of edges) {
-    if (!adj.has(s)) { adj.set(s, []); indeg.set(s, indeg.get(s) || 0); }
-    if (!adj.has(t)) { adj.set(t, []); indeg.set(t, indeg.get(t) || 0); }
-    adj.get(s).push(t);
-    indeg.set(t, (indeg.get(t) || 0) + 1);
-  }
-
-  const q = [];
-  for (const [n, d] of indeg.entries()) if (d === 0) q.push(n);
-  const order = [];
-  while (q.length) {
-    const n = q.shift();
-    order.push(n);
-    for (const t of adj.get(n) || []) {
-      indeg.set(t, indeg.get(t) - 1);
-      if (indeg.get(t) === 0) q.push(t);
-    }
-  }
-  if (order.length !== indeg.size) return null; // cycle
-
-  const dp = new Map();
-  for (const n of order) dp.set(n, 0);
-  let best = 0;
-  for (const n of order) {
-    const base = dp.get(n) || 0;
-    for (const t of adj.get(n) || []) {
-      const cand = base + 1;
-      if ((dp.get(t) || 0) < cand) dp.set(t, cand);
-      if (cand > best) best = cand;
-    }
-  }
-  return best;
-}
-
-function setCurrentSheet(sheetName) {
-  state.currentSheet = sheetName;
-  // update selects
-  $("sheetSelect").value = sheetName;
-  $("profileSheetSelect").value = sheetName;
-  $("chartsSheetSelect").value = sheetName;
-  $("exportSheetSelect").value = sheetName;
-  renderSheetTable();
-  renderProfile();
-  syncChartColumns();
-}
-
-function populateSheetSelects() {
-  const selects = ["sheetSelect", "profileSheetSelect", "chartsSheetSelect", "exportSheetSelect"].map(id => $(id));
-  for (const sel of selects) {
-    sel.innerHTML = "";
-    for (const s of state.sheetOrder) {
-      const opt = document.createElement("option");
-      opt.value = s;
-      opt.textContent = s;
-      sel.appendChild(opt);
-    }
-  }
-}
-
-function renderSheetTable() {
-  const sheetName = $("sheetSelect").value;
-  const flags = getUIFlags();
-  const rawRows = state.sheets[sheetName]?.rows || [];
-  const headers = getVisibleHeaders(sheetName, flags);
-  const displayRows = getDisplayRows(sheetName, flags);
-
-  $("sheetMeta").textContent = `${sheetName}: rows=${rawRows.length.toLocaleString()}, cols=${headers.length}`;
-
-  // build thead/tbody
-  const table = $("dataTable");
-  const thead = table.querySelector("thead");
-  const tbody = table.querySelector("tbody");
-  thead.innerHTML = "";
-  tbody.innerHTML = "";
-
-  const trh = document.createElement("tr");
-  for (const h of headers) {
-    const th = document.createElement("th");
-    th.textContent = h;
-    trh.appendChild(th);
-  }
-  thead.appendChild(trh);
-
-  for (const r of displayRows) {
-    const tr = document.createElement("tr");
-    for (const h of headers) {
-      const td = document.createElement("td");
-      const v = r[h];
-      td.textContent = isMissing(v) ? "" : String(v);
-      tr.appendChild(td);
-    }
-    tbody.appendChild(tr);
-  }
-
-  // DataTables init/destroy
-  if (state.dataTable) {
-    try { state.dataTable.destroy(); } catch(e) {}
-    state.dataTable = null;
-  }
-  state.dataTable = new DataTable(table, {
-    paging: true,
-    pageLength: 25,
-    lengthMenu: [ [25, 50, 100, 250], [25, 50, 100, 250] ],
-    searching: true,
-    info: true,
-    responsive: true,
-    order: [],
-  });
-}
-
-function renderProfile() {
-  const sheetName = $("profileSheetSelect").value;
-  const flags = getUIFlags();
-  const rows = state.sheets[sheetName]?.rows || [];
-  const headers = getVisibleHeaders(sheetName, flags);
-
-  const tbody = $("profileTable").querySelector("tbody");
-  tbody.innerHTML = "";
-
-  for (const h of headers) {
-    const colValuesRaw = rows.map(r => r[h]).filter(v => !isMissing(v)).slice(0, 2000);
-    const colType = detectColumnType(colValuesRaw.slice(0, 200));
-    const missing = rows.length - colValuesRaw.length;
-
-    const unique = new Set(colValuesRaw.map(v => String(v))).size;
-
-    let min = "", p50 = "", max = "", topStr = "";
-    if (colType === "number") {
-      const nums = colValuesRaw.map(v => safeNumber(v)).filter(v => v !== null).sort((a,b)=>a-b);
-      if (nums.length) {
-        min = nums[0].toFixed(3).replace(/\.?0+$/,"");
-        p50 = median(nums).toFixed(3).replace(/\.?0+$/,"");
-        max = nums[nums.length-1].toFixed(3).replace(/\.?0+$/,"");
-      }
-    } else if (colType === "date") {
-      const ds = colValuesRaw.map(v => safeDate(v)).filter(d => d).sort((a,b)=>a-b);
-      if (ds.length) {
-        min = toISODateString(ds[0]);
-        p50 = toISODateString(ds[Math.floor(ds.length/2)]);
-        max = toISODateString(ds[ds.length-1]);
-      }
-    } else if (colType === "string" || colType === "boolean") {
-      const top = freqTop(colValuesRaw, 5);
-      topStr = top.map(t => {
-        const v = t.value.length > 24 ? t.value.slice(0, 24) + "…" : t.value;
-        return `${v}(${t.count})`;
-      }).join(", ");
-    }
-
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="codeLike">${h}</td>
-      <td>${colType}</td>
-      <td class="text-end">${missing.toLocaleString()}</td>
-      <td class="text-end">${unique.toLocaleString()}</td>
-      <td class="text-end">${min}</td>
-      <td class="text-end">${p50}</td>
-      <td class="text-end">${max}</td>
-      <td>${topStr}</td>
-    `;
-    tbody.appendChild(tr);
-  }
-}
-
-function syncChartColumns() {
-  const sheetName = $("chartsSheetSelect").value;
-  const flags = getUIFlags();
-  const headers = getVisibleHeaders(sheetName, flags);
-
-  const xSel = $("xCol");
-  const ySel = $("yCol");
-  xSel.innerHTML = "";
-  ySel.innerHTML = "";
-
-  for (const h of headers) {
-    const optX = document.createElement("option");
-    optX.value = h; optX.textContent = h;
-    xSel.appendChild(optX);
-
-    const optY = document.createElement("option");
-    optY.value = h; optY.textContent = h;
-    ySel.appendChild(optY);
-  }
-
-  autoPickColumns();
-}
-
-function autoPickColumns() {
-  const sheetName = $("chartsSheetSelect").value;
-  const flags = getUIFlags();
-  const headers = getVisibleHeaders(sheetName, flags);
-  const rows = state.sheets[sheetName]?.rows || [];
-  const chartType = $("chartType").value;
-
-  const sample = (col) => rows.map(r => r[col]).filter(v => !isMissing(v)).slice(0, 200);
-
-  const colTypes = {};
-  for (const h of headers) colTypes[h] = detectColumnType(sample(h));
-
-  const numericCols = headers.filter(h => colTypes[h] === "number");
-  const dateCols = headers.filter(h => colTypes[h] === "date");
-  const stringCols = headers.filter(h => colTypes[h] === "string" || colTypes[h] === "boolean");
-
-  const xSel = $("xCol");
-  const ySel = $("yCol");
-
-  const setIf = (sel, col) => {
-    if (!col) return;
-    for (const opt of sel.options) {
-      if (opt.value === col) { sel.value = col; return; }
-    }
-  };
-
-  if (chartType === "hist") {
-    setIf(xSel, numericCols[0] || headers[0]);
-    setIf(ySel, numericCols[1] || numericCols[0] || headers[0]);
-    $("chartHint").textContent = "数値列を選ぶと分布が見えます。";
-  } else if (chartType === "barCount") {
-    setIf(xSel, stringCols[0] || headers[0]);
-    setIf(ySel, numericCols[0] || headers[0]);
-    $("chartHint").textContent = "カテゴリ列の件数を上位順に表示します（上位20）。";
-  } else if (chartType === "scatter") {
-    setIf(xSel, numericCols[0] || headers[0]);
-    setIf(ySel, numericCols[1] || numericCols[0] || headers[0]);
-    $("chartHint").textContent = "数値×数値の関係を散布図で表示します。";
-  } else if (chartType === "lineTime") {
-    setIf(xSel, dateCols[0] || headers[0]);
-    setIf(ySel, numericCols[0] || headers[0]);
-    $("chartHint").textContent = "日単位に集計して、Y列の平均を折れ線で表示します。";
-  } else if (chartType === "corr") {
-    setIf(xSel, numericCols[0] || headers[0]);
-    setIf(ySel, numericCols[1] || numericCols[0] || headers[0]);
-    $("chartHint").textContent = "数値列の相関（Pearson）をヒートマップ表示します（最大12列）。";
-  } else if (chartType === "sankey") {
-    $("chartHint").textContent = "source/target/value列があるシートで動作します。";
-  } else {
-    $("chartHint").textContent = "-";
-  }
-}
-
-function drawChart() {
-  const sheetName = $("chartsSheetSelect").value;
-  const flags = getUIFlags();
-  const rawRows = state.sheets[sheetName]?.rows || [];
-  const headers = getVisibleHeaders(sheetName, flags);
-
-  const chartType = $("chartType").value;
-  const xCol = $("xCol").value;
-  const yCol = $("yCol").value;
-
-  const target = "chartArea";
-  $("chartArea").innerHTML = ""; // clear
-
-  if (rawRows.length === 0 || headers.length === 0) {
-    $("chartArea").innerHTML = `<div class="text-muted small">データがありません</div>`;
-    return;
-  }
-
-  if (chartType === "sankey") {
-    if (headers.includes("source") && headers.includes("target") && headers.includes("value")) {
-      drawSankey(target, sheetName);
-    } else {
-      $("chartArea").innerHTML = `<div class="text-muted small">必要な列（source/target/value）がありません</div>`;
-    }
-    return;
-  }
-
-  if (chartType === "corr") {
-    // numeric columns
-    const sample = (col) => rawRows.map(r => r[col]).filter(v => !isMissing(v)).slice(0, 200);
-    const colTypes = {};
-    for (const h of headers) colTypes[h] = detectColumnType(sample(h));
-    const numericCols = headers.filter(h => colTypes[h] === "number").slice(0, 12);
-    if (numericCols.length < 2) {
-      $("chartArea").innerHTML = `<div class="text-muted small">数値列が不足しています</div>`;
-      return;
-    }
-    const { cols, z } = buildCorrelationMatrix(rawRows, numericCols);
-    Plotly.newPlot(target, [{
-      type: "heatmap",
-      x: cols,
-      y: cols,
-      z,
-      zmin: -1,
-      zmax: 1
-    }], {
-      margin: {l: 80, r: 10, t: 10, b: 80},
-    }, {displayModeBar: true, responsive: true});
-    return;
-  }
-
-  if (chartType === "hist") {
-    const xs = rawRows.map(r => safeNumber(r[xCol])).filter(v => v !== null);
-    if (xs.length === 0) {
-      $("chartArea").innerHTML = `<div class="text-muted small">X列が数値として解釈できません</div>`;
-      return;
-    }
-    Plotly.newPlot(target, [{
-      type: "histogram",
-      x: xs,
-      nbinsx: Math.min(60, Math.max(10, Math.round(Math.sqrt(xs.length))))
-    }], {
-      margin: {l: 50, r: 10, t: 10, b: 40},
-      xaxis: { title: xCol },
-      yaxis: { title: "count" }
-    }, {displayModeBar: true, responsive: true});
-    return;
-  }
-
-  if (chartType === "barCount") {
-    const vs = rawRows.map(r => r[xCol]).filter(v => !isMissing(v)).map(v => String(v));
-    if (vs.length === 0) {
-      $("chartArea").innerHTML = `<div class="text-muted small">X列が空です</div>`;
-      return;
-    }
-    const top = freqTop(vs, 20);
-    Plotly.newPlot(target, [{
-      type: "bar",
-      x: top.map(t => t.value),
-      y: top.map(t => t.count),
-    }], {
-      margin: {l: 50, r: 10, t: 10, b: 120},
-      xaxis: { tickangle: -45, title: xCol },
-      yaxis: { title: "count" }
-    }, {displayModeBar: true, responsive: true});
-    return;
-  }
-
-  if (chartType === "scatter") {
-    const x = [];
-    const y = [];
-    for (const r of rawRows) {
-      const xi = safeNumber(r[xCol]);
-      const yi = safeNumber(r[yCol]);
-      if (xi === null || yi === null) continue;
-      x.push(xi); y.push(yi);
-    }
-    if (x.length === 0) {
-      $("chartArea").innerHTML = `<div class="text-muted small">X/Y列が数値として解釈できません</div>`;
-      return;
-    }
-    Plotly.newPlot(target, [{
-      type: "scatter",
-      mode: "markers",
-      x, y,
-    }], {
-      margin: {l: 50, r: 10, t: 10, b: 40},
-      xaxis: { title: xCol },
-      yaxis: { title: yCol },
-    }, {displayModeBar: true, responsive: true});
-    return;
-  }
-
-  if (chartType === "lineTime") {
-    // group by day; y is average
-    const m = new Map(); // day -> {sum, cnt}
-    for (const r of rawRows) {
-      const d = safeDate(r[xCol]);
-      const yi = safeNumber(r[yCol]);
-      if (!d || yi === null) continue;
-      const day = toISODateString(d);
-      if (!m.has(day)) m.set(day, { sum: 0, cnt: 0 });
-      const obj = m.get(day);
-      obj.sum += yi; obj.cnt += 1;
-    }
-    const days = Array.from(m.keys()).sort();
-    if (days.length === 0) {
-      $("chartArea").innerHTML = `<div class="text-muted small">X列が日時、Y列が数値として解釈できません</div>`;
-      return;
-    }
-    const y = days.map(d => {
-      const obj = m.get(d);
-      return obj.cnt ? obj.sum / obj.cnt : 0;
-    });
-    Plotly.newPlot(target, [{
-      type: "scatter",
-      mode: "lines+markers",
-      x: days,
-      y,
-    }], {
-      margin: {l: 50, r: 10, t: 10, b: 40},
-      xaxis: { title: xCol },
-      yaxis: { title: `${yCol} (avg/day)` },
-    }, {displayModeBar: true, responsive: true});
-    return;
-  }
-
-  $("chartArea").innerHTML = `<div class="text-muted small">未対応のチャートタイプです</div>`;
-}
-
-function exportSheet(format) {
-  const sheetName = $("exportSheetSelect").value;
-  const flags = getUIFlags();
-  const headers = getVisibleHeaders(sheetName, flags);
-  const rows = getDisplayRows(sheetName, flags);
-
-  const stamp = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-  if (format === "csv") {
-    const csv = toCSV(rows, headers);
-    downloadText(`${sheetName}_${stamp}.csv`, csv, "text/csv");
-  } else if (format === "json") {
-    downloadText(`${sheetName}_${stamp}.json`, JSON.stringify(rows, null, 2), "application/json");
-  }
-}
-
-async function loadWorkbookFromFile(file) {
-  setStatus("読み込み中…", "muted");
-  const buf = await readFileAsArrayBuffer(file);
-
-  const wb = XLSX.read(buf, { type: "array", cellDates: true });
-  state.workbook = wb;
-  state.sheets = {};
-  state.sheetOrder = wb.SheetNames.slice();
-
-  for (const name of wb.SheetNames) {
-    const ws = wb.Sheets[name];
-    // header:1 -> array-of-arrays (preserve column order)
-    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
-    const headersRaw = (aoa[0] || []).map((h, idx) => {
-      if (h === null || h === undefined || String(h).trim() === "") return `col${idx+1}`;
-      return String(h);
-    });
-    const rowsA = aoa.slice(1);
-
-    // drop trailing fully-empty rows
-    const rowsTrimmed = rowsA.filter(r => Array.isArray(r) && r.some(v => !isMissing(v)));
-
-    const rows = rowsTrimmed.map(r => {
-      const obj = {};
-      for (let i = 0; i < headersRaw.length; i++) {
-        obj[headersRaw[i]] = normalizeCellValue(r[i]);
-      }
-      return obj;
-    });
-
-    state.sheets[name] = { headers: headersRaw, rows };
-  }
-
-  populateSheetSelects();
-  setStatus(`読込完了: ${file.name}（${state.sheetOrder.length} sheets）`, "success");
-
-  // show contents
-  ["overviewEmpty","diagEmpty","referralEmpty","sheetEmpty","profileEmpty","chartsEmpty","exportEmpty"].forEach(id => $(id).classList.add("d-none"));
-  ["overviewContent","diagContent","referralContent","sheetContent","profileContent","chartsContent","exportContent"].forEach(id => $(id).classList.remove("d-none"));
-
-  // set default sheet
-  const preferred = state.sheets["diagnosis"] ? "diagnosis" : state.sheetOrder[0];
-  setCurrentSheet(preferred);
-
-  renderOverview();
-  renderDiagnosisInit();
-  renderReferralDeepDive();
-}
-
-
-
-/* -----------------------------
- * Diagnosis analysis (specialized)
- * ----------------------------- */
-
-function parseAgeNumber(v) {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "string") {
-    const s = v.trim();
-    if (s === "" || s.toLowerCase() === "nan") return null;
-
-    // "26+"
-    let m = s.match(/^(\d+)\s*\+\s*$/);
-    if (m) return Number(m[1]);
-
-    // "23-25" / "23〜25" / "23~25" etc
-    m = s.match(/^(\d+)\s*[-〜~–—]\s*(\d+)\s*$/);
-    if (m) return (Number(m[1]) + Number(m[2])) / 2;
-
-    // plain numeric
-    const x = Number(s);
-    if (Number.isFinite(x)) return x;
-
-    // fallback: first number
-    m = s.match(/(\d+)/);
-    if (m) return Number(m[1]);
-  }
-  return null;
-}
-
-function normalizeGender(v) {
-  const s = String(v || "").trim().toLowerCase();
-  if (s === "female" || s === "male") return s;
-  return "unknown";
-}
-
-function parseInterested(v) {
-  // interested is expected to be 1 or null; handle string/boolean defensively
-  if (v === true) return 1;
-  if (v === false) return 0;
-  const n = safeNumber(v);
-  if (n === 1) return 1;
-  return 0;
-}
-
-function parseAnswersFromRawJson(raw) {
-  if (isMissing(raw)) return null;
-  if (typeof raw === "object") {
-    const ans = raw.answers;
-    if (ans && typeof ans === "object") return ans;
-    return null;
-  }
-  if (typeof raw !== "string") return null;
-  try {
-    const obj = JSON.parse(raw);
-    const ans = obj?.answers;
-    if (ans && typeof ans === "object") return ans;
-    return null;
-  } catch (e) {
-    return null;
-  }
-}
-
-function sortQuestionKeys(keys) {
-  return keys.slice().sort((a, b) => {
-    const ma = String(a).match(/^([A-Za-z]+)(\d+)$/);
-    const mb = String(b).match(/^([A-Za-z]+)(\d+)$/);
-    if (ma && mb) {
-      if (ma[1] !== mb[1]) return ma[1].localeCompare(mb[1]);
-      return Number(ma[2]) - Number(mb[2]);
-    }
-    return String(a).localeCompare(String(b));
-  });
-}
-
-function getAgeBinLabel(age) {
-  if (age === null || age === undefined || !Number.isFinite(age)) return "unknown";
-  if (age < 16) return "13-15";
-  if (age < 19) return "16-18";
-  if (age < 23) return "19-22";
-  return "23+";
-}
-
-function dominantAxisLabel(r) {
-  const a = r.axisA, b = r.axisB, c = r.axisC, d = r.axisD;
-  const arr = [
-    { k: "A", v: a },
-    { k: "B", v: b },
-    { k: "C", v: c },
-    { k: "D", v: d },
-  ].filter(o => o.v !== null && o.v !== undefined && Number.isFinite(o.v));
-  if (arr.length === 0) return null;
-  arr.sort((x, y) => y.v - x.v);
-  return arr[0].k;
-}
-
-function prepareDiagnosisCache() {
-  if (!state.sheets["diagnosis"]) {
-    state.diag = null;
-    return;
-  }
-
-  const rawRows = state.sheets["diagnosis"].rows || [];
-  const rows = [];
-
-  const typeCount = new Map();
-  const qKeySet = new Set();
-  let parseOk = 0;
-
-  let minDay = null, maxDay = null;
-  let minAge = null, maxAge = null;
-
-  for (const r of rawRows) {
-    const d = safeDate(r["createdAt"]);
-    const day = d ? toISODateString(d) : null;
-
-    if (day) {
-      if (!minDay || day < minDay) minDay = day;
-      if (!maxDay || day > maxDay) maxDay = day;
-    }
-
-    const type = isMissing(r["type"]) ? "(missing)" : String(r["type"]);
-    typeCount.set(type, (typeCount.get(type) || 0) + 1);
-
-    const ageRaw = r["age"];
-    const ageNum = parseAgeNumber(ageRaw);
-    if (ageNum !== null) {
-      minAge = (minAge === null) ? ageNum : Math.min(minAge, ageNum);
-      maxAge = (maxAge === null) ? ageNum : Math.max(maxAge, ageNum);
-    }
-
-    const answers = parseAnswersFromRawJson(r["raw_json"]);
-    if (answers) {
-      parseOk++;
-      for (const k of Object.keys(answers)) qKeySet.add(k);
-    }
-
-    rows.push({
-      createdAt: d,
-      createdDay: day,
-      email: r["email"],
-      gender: normalizeGender(r["gender"]),
-      type,
-      age_raw: ageRaw,
-      age_num: ageNum,
-      axisA: safeNumber(r["axisA"]),
-      axisB: safeNumber(r["axisB"]),
-      axisC: safeNumber(r["axisC"]),
-      axisD: safeNumber(r["axisD"]),
-      interested: parseInterested(r["interested"]),
-      raw_json: r["raw_json"],
-      answers: answers || null,
-    });
-  }
-
-  const typesSorted = Array.from(typeCount.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([t, c]) => ({ type: t, count: c }));
-
-  const qKeys = sortQuestionKeys(Array.from(qKeySet));
-
-  state.diag = {
-    rows,
-    typeCount,
-    typesSorted,
-    qKeys,
-    parseOk,
-    total: rows.length,
-    minDay,
-    maxDay,
-    minAge,
-    maxAge,
-    defaults: {
-      dateStart: minDay || "",
-      dateEnd: maxDay || "",
-      gender: "all",
-      type: "all",
-      ageMin: (minAge !== null) ? String(Math.floor(minAge)) : "",
-      ageMax: (maxAge !== null) ? String(Math.ceil(maxAge)) : "",
-      includeMissingAge: true,
-      axis: "axisA",
-      axisGroupBy: "type",
-      axisTopN: 10,
-      qKey: qKeys[0] || "",
-    }
-  };
-}
-
-function setupDiagnosisControls() {
-  if (!state.diag) return;
-
-  // type select
-  const typeSel = $("diagType");
-  if (typeSel) {
-    typeSel.innerHTML = "";
-    const optAll = document.createElement("option");
-    optAll.value = "all"; optAll.textContent = "all";
-    typeSel.appendChild(optAll);
-    for (const obj of state.diag.typesSorted) {
-      const opt = document.createElement("option");
-      opt.value = obj.type;
-      opt.textContent = `${obj.type} (${obj.count})`;
-      typeSel.appendChild(opt);
-    }
-  }
-
-  // question key select
-  const qSel = $("diagQKey");
-  if (qSel) {
-    qSel.innerHTML = "";
-    if (state.diag.qKeys.length === 0) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "(answers が見つかりません)";
-      qSel.appendChild(opt);
-    } else {
-      for (const k of state.diag.qKeys) {
-        const opt = document.createElement("option");
-        opt.value = k;
-        opt.textContent = k;
-        qSel.appendChild(opt);
-      }
-    }
-  }
-
-  resetDiagnosisFiltersToDefaults(false);
-}
-
-function resetDiagnosisFiltersToDefaults(renderAfter = true) {
-  if (!state.diag) return;
-  const d = state.diag.defaults;
-
-  if ($("diagDateStart")) $("diagDateStart").value = d.dateStart || "";
-  if ($("diagDateEnd")) $("diagDateEnd").value = d.dateEnd || "";
-  if ($("diagGender")) $("diagGender").value = d.gender || "all";
-  if ($("diagType")) $("diagType").value = d.type || "all";
-  if ($("diagAgeMin")) $("diagAgeMin").value = d.ageMin || "";
-  if ($("diagAgeMax")) $("diagAgeMax").value = d.ageMax || "";
-  if ($("diagIncludeMissingAge")) $("diagIncludeMissingAge").checked = !!d.includeMissingAge;
-
-  if ($("diagAxisSelect")) $("diagAxisSelect").value = d.axis || "axisA";
-  if ($("diagAxisGroupBy")) $("diagAxisGroupBy").value = d.axisGroupBy || "type";
-  if ($("diagAxisTopN")) $("diagAxisTopN").value = String(d.axisTopN || 10);
-
-  if ($("diagQKey")) $("diagQKey").value = d.qKey || "";
-
-  if (renderAfter) renderDiagnosisAnalysis();
-}
-
-function getDiagnosisFiltersFromUI() {
-  const ageMin = safeNumber($("diagAgeMin")?.value);
-  const ageMax = safeNumber($("diagAgeMax")?.value);
-
-  const topNRaw = safeNumber($("diagAxisTopN")?.value);
-  const axisTopN = Math.max(3, Math.min(30, Math.round(topNRaw || 10)));
-
-  return {
-    dateStart: $("diagDateStart")?.value || null,
-    dateEnd: $("diagDateEnd")?.value || null,
-    gender: $("diagGender")?.value || "all",
-    type: $("diagType")?.value || "all",
-    ageMin: ageMin === null ? null : ageMin,
-    ageMax: ageMax === null ? null : ageMax,
-    includeMissingAge: $("diagIncludeMissingAge")?.checked ?? true,
-    axis: $("diagAxisSelect")?.value || "axisA",
-    axisGroupBy: $("diagAxisGroupBy")?.value || "type",
-    axisTopN,
-    qKey: $("diagQKey")?.value || "",
-  };
-}
-
-function filterDiagnosisRows(rows, f) {
-  return rows.filter(r => {
-    if ((f.dateStart || f.dateEnd) && !r.createdDay) return false;
-    if (f.dateStart && r.createdDay < f.dateStart) return false;
-    if (f.dateEnd && r.createdDay > f.dateEnd) return false;
-
-    if (f.gender !== "all" && r.gender !== f.gender) return false;
-    if (f.type !== "all" && r.type !== f.type) return false;
-
-    const age = r.age_num;
-    if (age === null || age === undefined || !Number.isFinite(age)) {
-      if (!f.includeMissingAge && (f.ageMin !== null || f.ageMax !== null)) return false;
-    } else {
-      if (f.ageMin !== null && age < f.ageMin) return false;
-      if (f.ageMax !== null && age > f.ageMax) return false;
-    }
-    return true;
-  });
-}
-
-function meanOf(nums) {
-  const xs = nums.filter(v => v !== null && v !== undefined && Number.isFinite(v));
-  if (xs.length === 0) return null;
-  return xs.reduce((a, b) => a + b, 0) / xs.length;
-}
-
-function medianOf(nums) {
-  const xs = nums.filter(v => v !== null && v !== undefined && Number.isFinite(v)).sort((a, b) => a - b);
-  if (xs.length === 0) return null;
-  return median(xs);
-}
-
-function renderDiagnosisInit() {
-  // Called after workbook load
-  const hasDiagnosis = !!state.sheets["diagnosis"];
-  if (!hasDiagnosis) {
-    if ($("diagNoSheet")) $("diagNoSheet").classList.remove("d-none");
-    if ($("diagContent")) $("diagContent").classList.add("d-none");
-    return;
-  }
-  if ($("diagNoSheet")) $("diagNoSheet").classList.add("d-none");
-  if ($("diagContent")) $("diagContent").classList.remove("d-none");
-
-  prepareDiagnosisCache();
-  setupDiagnosisControls();
-  renderDiagnosisAnalysis();
-}
-
-function renderDiagnosisAnalysis() {
-  if (!state.diag) return;
-
-  const f = getDiagnosisFiltersFromUI();
-  const rows = filterDiagnosisRows(state.diag.rows, f);
-
-  if ($("diagN")) $("diagN").textContent = `N=${rows.length.toLocaleString()}`;
-
-  renderDiagnosisKPIs(rows);
-  renderDiagnosisTypeCharts(rows);
-  renderDiagnosisTypeTable(rows);
-  renderDiagnosisAxisBox(rows, f);
-  renderDiagnosisCorr(rows);
-  renderDiagnosisInterestedSegments(rows);
-  renderDiagnosisDominantAxis(rows);
-  renderDiagnosisQuestion(rows, f.qKey);
-  renderDiagnosisQuality(rows);
-}
-
-function renderDiagnosisKPIs(rows) {
-  const n = rows.length;
-  if (n === 0) {
-    ["diagKpiRows","diagKpiInterestedRate","diagKpiUniqueEmail","diagKpiAgeMedian","diagKpiFemaleRate","diagKpiJsonParseRate"]
-      .forEach(id => { if ($(id)) $(id).textContent = "-"; });
-    return;
-  }
-
-  const interested = rows.reduce((s, r) => s + (r.interested || 0), 0);
-  const rate = interested / n;
-
-  const emails = new Set(rows.map(r => r.email).filter(v => !isMissing(v)).map(v => String(v)));
-  const ages = rows.map(r => r.age_num);
-  const ageMed = medianOf(ages);
-
-  const female = rows.filter(r => r.gender === "female").length;
-  const femaleRate = female / n;
-
-  const parsed = rows.filter(r => r.answers).length;
-  const parseRate = parsed / n;
-
-  if ($("diagKpiRows")) $("diagKpiRows").textContent = n.toLocaleString();
-  if ($("diagKpiInterestedRate")) $("diagKpiInterestedRate").textContent = (rate * 100).toFixed(1) + "%";
-  if ($("diagKpiUniqueEmail")) $("diagKpiUniqueEmail").textContent = emails.size.toLocaleString();
-  if ($("diagKpiAgeMedian")) $("diagKpiAgeMedian").textContent = (ageMed === null ? "-" : ageMed.toFixed(1).replace(/\.0$/, ""));
-  if ($("diagKpiFemaleRate")) $("diagKpiFemaleRate").textContent = (femaleRate * 100).toFixed(1) + "%";
-  if ($("diagKpiJsonParseRate")) $("diagKpiJsonParseRate").textContent = (parseRate * 100).toFixed(1) + "%";
-}
-
-function renderDiagnosisTypeCharts(rows) {
-  const typeM = new Map();
-  const intM = new Map(); // type -> interested sum
-  for (const r of rows) {
-    const t = r.type || "(missing)";
-    typeM.set(t, (typeM.get(t) || 0) + 1);
-    intM.set(t, (intM.get(t) || 0) + (r.interested || 0));
-  }
-
-  const arr = Array.from(typeM.entries()).map(([t, c]) => ({ type: t, count: c, interested: intM.get(t) || 0 }));
-  arr.sort((a, b) => b.count - a.count);
-
-  // Count chart (top 20 + Other)
-  const topK = 20;
-  const top = arr.slice(0, topK);
-  const rest = arr.slice(topK);
-  const otherCount = rest.reduce((s, o) => s + o.count, 0);
-  const x1 = top.map(o => o.type);
-  const y1 = top.map(o => o.count);
-  if (otherCount > 0) { x1.push("Other"); y1.push(otherCount); }
-
-  Plotly.newPlot("plotDiagTypeCount", [{
-    type: "bar",
-    x: x1,
-    y: y1,
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 120},
-    xaxis: { tickangle: -45, title: "type" },
-    yaxis: { title: "count" }
-  }, {displayModeBar: true, responsive: true});
-
-  // Interested rate chart (top 20 by count)
-  const x2 = top.map(o => o.type);
-  const y2 = top.map(o => o.count ? (o.interested / o.count) : 0);
-
-  Plotly.newPlot("plotDiagInterestedByType", [{
-    type: "bar",
-    x: x2,
-    y: y2,
-    text: y2.map(v => (v * 100).toFixed(1) + "%"),
-    textposition: "auto",
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 120},
-    xaxis: { tickangle: -45, title: "type" },
-    yaxis: { title: "Interested rate", tickformat: ".0%", range: [0, 1] }
-  }, {displayModeBar: true, responsive: true});
-}
-
-function renderDiagnosisTypeTable(rows) {
-  const typeM = new Map();
-  for (const r of rows) {
-    const t = r.type || "(missing)";
-    if (!typeM.has(t)) typeM.set(t, { type: t, n: 0, interested: 0, axisA: [], axisB: [], axisC: [], axisD: [], ages: [] });
-    const o = typeM.get(t);
-    o.n++;
-    o.interested += (r.interested || 0);
-    if (Number.isFinite(r.axisA)) o.axisA.push(r.axisA);
-    if (Number.isFinite(r.axisB)) o.axisB.push(r.axisB);
-    if (Number.isFinite(r.axisC)) o.axisC.push(r.axisC);
-    if (Number.isFinite(r.axisD)) o.axisD.push(r.axisD);
-    if (Number.isFinite(r.age_num)) o.ages.push(r.age_num);
-  }
-
-  const arr = Array.from(typeM.values()).map(o => ({
-    type: o.type,
-    n: o.n,
-    interested: o.interested,
-    rate: o.n ? o.interested / o.n : 0,
-    axisA: meanOf(o.axisA),
-    axisB: meanOf(o.axisB),
-    axisC: meanOf(o.axisC),
-    axisD: meanOf(o.axisD),
-    age_mean: meanOf(o.ages),
-  })).sort((a, b) => b.n - a.n);
-
-  const tbody = $("diagTypeTable")?.querySelector("tbody");
-  if (!tbody) return;
-  tbody.innerHTML = "";
-
-  const show = arr.slice(0, 50);
-  for (const o of show) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="codeLike">${o.type}</td>
-      <td class="text-end">${o.n.toLocaleString()}</td>
-      <td class="text-end">${o.interested.toLocaleString()}</td>
-      <td class="text-end">${(o.rate * 100).toFixed(1)}%</td>
-      <td class="text-end">${(o.axisA === null ? "" : o.axisA.toFixed(1))}</td>
-      <td class="text-end">${(o.axisB === null ? "" : o.axisB.toFixed(1))}</td>
-      <td class="text-end">${(o.axisC === null ? "" : o.axisC.toFixed(1))}</td>
-      <td class="text-end">${(o.axisD === null ? "" : o.axisD.toFixed(1))}</td>
-      <td class="text-end">${(o.age_mean === null ? "" : o.age_mean.toFixed(1).replace(/\.0$/, ""))}</td>
-    `;
-    tbody.appendChild(tr);
-  }
-
-  // DataTables init/destroy for diagnosis table
-  const table = $("diagTypeTable");
-  if (state.diagTypeDT) {
-    try { state.diagTypeDT.destroy(); } catch(e) {}
-    state.diagTypeDT = null;
-  }
-  state.diagTypeDT = new DataTable(table, {
-    paging: true,
-    pageLength: 25,
-    lengthMenu: [ [25, 50, 100], [25, 50, 100] ],
-    searching: true,
-    info: true,
-    responsive: true,
-    order: [[1, "desc"]],
-  });
-}
-
-function renderDiagnosisAxisBox(rows, f) {
-  const axis = f.axis;
-  const groupBy = f.axisGroupBy;
-
-  if (!["axisA","axisB","axisC","axisD"].includes(axis)) return;
-
-  let groups = new Map();
-
-  if (groupBy === "gender") {
-    const order = ["female","male","unknown"];
-    for (const g of order) groups.set(g, []);
+  function toCSV(rows, columns) {
+    const cols = columns ?? (rows.length ? Object.keys(rows[0]) : []);
+    const header = cols.map(c => `"${String(c).replaceAll('"', '""')}"`).join(',');
+    const lines = [header];
     for (const r of rows) {
-      const v = r[axis];
+      const line = cols.map(c => {
+        const v = r[c];
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'object') return `"${JSON.stringify(v).replaceAll('"', '""')}"`;
+        return `"${String(v).replaceAll('"', '""')}"`;
+      }).join(',');
+      lines.push(line);
+    }
+    return lines.join('\n');
+  }
+
+  // -----------------------------
+  // Excel parsing (only 2 sheets)
+  // -----------------------------
+  function sheetToRows(workbook, sheetName) {
+    const ws = workbook.Sheets[sheetName];
+    if (!ws) return [];
+    return XLSX.utils.sheet_to_json(ws, { defval: null });
+  }
+
+  function detectColumns(rows) {
+    const keys = new Set();
+    for (const r of rows) Object.keys(r).forEach(k => keys.add(k));
+    return Array.from(keys);
+  }
+
+  function makeProfileTable(rows, hideUnnamed) {
+    const keys = detectColumns(rows).filter(k => {
+      if (!hideUnnamed) return true;
+      return !/^Unnamed/i.test(k);
+    });
+
+    const lines = [];
+    lines.push('<div class="table-responsive"><table class="table table-sm table-bordered align-middle">');
+    lines.push('<thead><tr><th>列</th><th>欠損</th><th>ユニーク</th><th>型（推定）</th><th>例（上位3）</th></tr></thead><tbody>');
+
+    for (const k of keys.sort()) {
+      const vals = rows.map(r => r[k]).filter(v => v !== null && v !== undefined && v !== '');
+      const missing = rows.length - vals.length;
+      const uniq = new Set(vals.map(v => (typeof v === 'object' ? JSON.stringify(v) : String(v)))).size;
+
+      let typ = 'mixed';
+      const numCount = vals.filter(v => Number.isFinite(Number(v))).length;
+      const dateCount = vals.filter(v => {
+        const d = parseISODate(v);
+        return d !== null;
+      }).length;
+      if (vals.length === 0) typ = 'empty';
+      else if (numCount / vals.length > 0.9) typ = 'number';
+      else if (dateCount / vals.length > 0.9) typ = 'date';
+      else typ = 'text';
+
+      const freq = groupCount(vals, v => (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+      const top = Array.from(freq.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3)
+        .map(([val, c]) => `${escapeHtml(val)} (${c})`).join('<br/>');
+
+      lines.push(`<tr>
+        <td class="text-nowrap">${escapeHtml(k)}</td>
+        <td>${missing}</td>
+        <td>${uniq}</td>
+        <td>${typ}</td>
+        <td class="small">${top || '—'}</td>
+      </tr>`);
+    }
+
+    lines.push('</tbody></table></div>');
+    return lines.join('\n');
+  }
+
+  // -----------------------------
+  // Normalization
+  // -----------------------------
+  function normalizeDiagnosis(rows) {
+    // expected columns: createdAt, email, age, gender, type, axisA-D, answers_json/raw_json, interested
+    return rows.map((r, idx) => {
+      const createdAtRaw = r.createdAt ?? r.created_at ?? r.timestamp ?? null;
+      const createdAt = parseISODate(createdAtRaw);
+      const createdDate = createdAt ? toISODateString(createdAt) : null;
+
+      const emailRaw = r.email ?? r.userEmail ?? r.mail ?? null;
+      const email = (emailRaw ?? '').toString().trim();
+      const emailLower = normalizeEmail(email);
+
+      const gender = normalizeGender(r.gender);
+      const type = normalizeType(r.type);
+
+      const ageRaw = r.age;
+      const ageNum = parseAgeToNumber(ageRaw);
+
+      const axisA = safeNumber(r.axisA);
+      const axisB = safeNumber(r.axisB);
+      const axisC = safeNumber(r.axisC);
+      const axisD = safeNumber(r.axisD);
+
+      const interestedRaw = r.interested;
+      const interested = (interestedRaw === 1 || interestedRaw === '1' || interestedRaw === true);
+
+      // answers
+      let answers = null;
+      const a1 = parseJsonSafe(r.answers_json);
+      if (a1 && typeof a1 === 'object' && Object.keys(a1).length) answers = a1;
+
+      if (!answers) {
+        const raw = parseJsonSafe(r.raw_json);
+        if (raw && typeof raw === 'object' && raw.answers && typeof raw.answers === 'object') answers = raw.answers;
+      }
+
+      // flatten answers to numeric map (A1..D10)
+      const ansFlat = {};
+      if (answers && typeof answers === 'object') {
+        for (const [k, v] of Object.entries(answers)) {
+          const n = safeNumber(v);
+          if (n !== null) ansFlat[k] = n;
+        }
+      }
+
+      return {
+        _row: idx,
+        createdAtRaw,
+        createdAt,
+        createdDate,
+        email,
+        emailLower,
+        name: r.name ?? null,
+        gender,
+        ageRaw,
+        ageNum,
+        type,
+        axisA, axisB, axisC, axisD,
+        interested,
+        answers: ansFlat,
+        raw: r
+      };
+    });
+  }
+
+  function normalizeReferralEvents(rows) {
+    return rows.map((r, idx) => {
+      const timestampRaw = r.timestamp ?? r.createdAt ?? r.time ?? null;
+      const ts = parseISODate(timestampRaw);
+      const date = ts ? toISODateString(ts) : null;
+
+      const eventType = (r.eventType ?? r.type ?? r.event ?? '').toString().trim();
+      const userId = (r.userId ?? '').toString().trim() || null;
+      const referrerId = (r.referrerId ?? '').toString().trim() || null;
+
+      const payload = parseJsonSafe(r.payload_json) || parseJsonSafe(r.payload) || parseJsonSafe(r.data) || null;
+
+      const platform = payload?.platform ?? null;
+      const userEmail = payload?.userEmail ?? payload?.email ?? null;
+      const userEmailLower = normalizeEmail(userEmail);
+      const userName = payload?.userName ?? null;
+      const userType = payload?.userType ?? null;
+      const gender = normalizeGender(payload?.gender);
+
+      return {
+        _row: idx,
+        timestampRaw,
+        ts,
+        date,
+        eventType,
+        userId,
+        referrerId,
+        edge: r.edge ?? null,
+        platform,
+        payload,
+        userEmail,
+        userEmailLower,
+        userName,
+        userType,
+        gender,
+        raw: r
+      };
+    });
+  }
+
+  // -----------------------------
+  // Derived computations
+  // -----------------------------
+  function buildDiagnosisUsers(diagRecords) {
+    // user = emailLower grouping; for missing email, fallback to row-id based pseudo user
+    const byEmail = new Map();
+    for (const rec of diagRecords) {
+      const key = rec.emailLower ?? `__noemail__${rec._row}`;
+      if (!byEmail.has(key)) byEmail.set(key, []);
+      byEmail.get(key).push(rec);
+    }
+
+    const users = [];
+    for (const [key, recs] of byEmail.entries()) {
+      recs.sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
+      const latest = recs[recs.length - 1];
+      const favoriteRecs = recs.filter(r => r.interested);
+      const hasFavorite = favoriteRecs.length > 0;
+      const latestFav = hasFavorite ? favoriteRecs[favoriteRecs.length - 1] : null;
+
+      users.push({
+        userKey: key,
+        emailLower: latest.emailLower,
+        email: latest.email,
+        latestRecord: latest,
+        hasFavorite,
+        favoriteCount: favoriteRecs.length,
+        latestFavoriteRecord: latestFav,
+        records: recs
+      });
+    }
+
+    return users;
+  }
+
+  function buildReferralDerived(refEvents) {
+    // daily aggregation
+    const dailyMap = new Map(); // date -> {date, share, visit, complete, platformCounts}
+    for (const ev of refEvents) {
+      if (!ev.date) continue;
+      if (!dailyMap.has(ev.date)) {
+        dailyMap.set(ev.date, {
+          date: ev.date,
+          share: 0,
+          referral_visit: 0,
+          referral_complete: 0,
+          platforms: new Map()
+        });
+      }
+      const d = dailyMap.get(ev.date);
+      if (ev.eventType in d) d[ev.eventType] += 1;
+      if (ev.eventType === 'share') {
+        const p = (ev.platform ?? 'unknown').toString();
+        d.platforms.set(p, (d.platforms.get(p) ?? 0) + 1);
+      }
+    }
+
+    const refDaily = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date))
+      .map(d => ({
+        date: d.date,
+        share: d.share,
+        referral_visit: d.referral_visit,
+        referral_complete: d.referral_complete,
+        platforms: Object.fromEntries(d.platforms.entries())
+      }));
+
+    // referrer meta from share payloads
+    const referrerMeta = new Map();
+    for (const ev of refEvents) {
+      if (ev.eventType !== 'share') continue;
+      const rid = ev.userId || ev.referrerId;
+      if (!rid) continue;
+      // pick the most recent meta
+      const prev = referrerMeta.get(rid);
+      if (!prev || ((ev.ts?.getTime() ?? 0) > (prev._ts ?? 0))) {
+        referrerMeta.set(rid, {
+          referrerId: rid,
+          userName: ev.userName,
+          userEmail: ev.userEmail,
+          userType: ev.userType,
+          gender: ev.gender,
+          _ts: ev.ts?.getTime() ?? 0,
+          platforms: new Map()
+        });
+      }
+      const meta = referrerMeta.get(rid);
+      const p = (ev.platform ?? 'unknown').toString();
+      meta.platforms.set(p, (meta.platforms.get(p) ?? 0) + 1);
+    }
+
+    // user meta from completes
+    const userMeta = new Map();
+    for (const ev of refEvents) {
+      if (ev.eventType !== 'referral_complete') continue;
+      if (!ev.userId) continue;
+      const prev = userMeta.get(ev.userId);
+      if (!prev || ((ev.ts?.getTime() ?? 0) > (prev._ts ?? 0))) {
+        userMeta.set(ev.userId, {
+          userId: ev.userId,
+          userName: ev.userName,
+          userEmail: ev.userEmail,
+          userEmailLower: ev.userEmailLower,
+          userType: ev.userType,
+          gender: ev.gender,
+          _ts: ev.ts?.getTime() ?? 0
+        });
+      }
+    }
+
+    // build edges and journeys
+    const journey = new Map(); // key `${referrerId}__${userId}` -> info
+    function touch(key, init) {
+      if (!journey.has(key)) journey.set(key, init());
+      return journey.get(key);
+    }
+
+    for (const ev of refEvents) {
+      if (!ev.referrerId || !ev.userId) continue;
+      const key = `${ev.referrerId}__${ev.userId}`;
+      const j = touch(key, () => ({
+        referrerId: ev.referrerId,
+        userId: ev.userId,
+        visitCount: 0,
+        completeCount: 0,
+        firstVisitTs: null,
+        firstCompleteTs: null,
+        lastTs: null
+      }));
+
+      const t = ev.ts?.getTime() ?? null;
+      if (t !== null) j.lastTs = j.lastTs === null ? t : Math.max(j.lastTs, t);
+
+      if (ev.eventType === 'referral_visit') {
+        j.visitCount += 1;
+        if (t !== null) j.firstVisitTs = j.firstVisitTs === null ? t : Math.min(j.firstVisitTs, t);
+      } else if (ev.eventType === 'referral_complete') {
+        j.completeCount += 1;
+        if (t !== null) j.firstCompleteTs = j.firstCompleteTs === null ? t : Math.min(j.firstCompleteTs, t);
+      }
+    }
+
+    const edgesVisitsMap = new Map();
+    const edgesCompletesMap = new Map();
+
+    for (const j of journey.values()) {
+      if (j.visitCount > 0) {
+        const k = `${j.referrerId}__${j.userId}`;
+        edgesVisitsMap.set(k, (edgesVisitsMap.get(k) ?? 0) + j.visitCount);
+      }
+      if (j.completeCount > 0) {
+        const k = `${j.referrerId}__${j.userId}`;
+        edgesCompletesMap.set(k, (edgesCompletesMap.get(k) ?? 0) + j.completeCount);
+      }
+    }
+
+    const edgesVisits = Array.from(edgesVisitsMap.entries()).map(([k, v]) => {
+      const [referrerId, userId] = k.split('__');
+      return { referrerId, userId, value: v };
+    }).sort((a, b) => b.value - a.value);
+
+    const edgesCompletes = Array.from(edgesCompletesMap.entries()).map(([k, v]) => {
+      const [referrerId, userId] = k.split('__');
+      return { referrerId, userId, value: v };
+    }).sort((a, b) => b.value - a.value);
+
+    return { refDaily, referrerMeta, userMeta, edgesVisits, edgesCompletes, journey };
+  }
+
+  function buildCompleteEmailMap(refEvents) {
+    // emailLower -> latest complete {referrerId, ts}
+    const m = new Map();
+    for (const ev of refEvents) {
+      if (ev.eventType !== 'referral_complete') continue;
+      if (!ev.userEmailLower) continue;
+      const t = ev.ts?.getTime() ?? 0;
+      const prev = m.get(ev.userEmailLower);
+      if (!prev || t > prev.ts) m.set(ev.userEmailLower, { referrerId: ev.referrerId, ts: t });
+    }
+    return m;
+  }
+
+  function enrichDiagnosisWithReferral(diagRecords, completeEmailToReferrer) {
+    for (const rec of diagRecords) {
+      const key = rec.emailLower;
+      if (!key) {
+        rec.referred = false;
+        rec.referrerId = null;
+        continue;
+      }
+      const info = completeEmailToReferrer.get(key);
+      rec.referred = !!info;
+      rec.referrerId = info?.referrerId ?? null;
+      rec.referralCompleteTs = info?.ts ?? null;
+    }
+  }
+
+  function buildReferrerStats(refEvents, referrerMeta, diagUserIndex) {
+    // counts per referrerId based on events
+    const byRef = new Map();
+    function get(referrerId) {
+      if (!byRef.has(referrerId)) {
+        byRef.set(referrerId, {
+          referrerId,
+          shares: 0,
+          sharesByPlatform: new Map(),
+          visitUsers: new Set(),
+          completeUsers: new Set(),
+          completeEmails: new Set(),
+          ttcHours: [],
+          matchedCompletes: 0,
+          matchedFavoriteUsers: 0,
+          matchedFavoriteRate: null
+        });
+      }
+      return byRef.get(referrerId);
+    }
+
+    // first visit ts per (referrer,user)
+    const firstVisitTs = new Map(); // key -> ts
+    for (const ev of refEvents) {
+      if (!ev.referrerId || !ev.userId) continue;
+      if (ev.eventType !== 'referral_visit') continue;
+      const key = `${ev.referrerId}__${ev.userId}`;
+      const t = ev.ts?.getTime() ?? null;
+      if (t === null) continue;
+      const prev = firstVisitTs.get(key);
+      if (prev === undefined || t < prev) firstVisitTs.set(key, t);
+    }
+
+    for (const ev of refEvents) {
+      if (ev.eventType === 'share') {
+        const rid = ev.userId || ev.referrerId;
+        if (!rid) continue;
+        const s = get(rid);
+        s.shares += 1;
+        const p = (ev.platform ?? 'unknown').toString();
+        s.sharesByPlatform.set(p, (s.sharesByPlatform.get(p) ?? 0) + 1);
+        continue;
+      }
+
+      if (!ev.referrerId) continue;
+      const s = get(ev.referrerId);
+
+      if (ev.eventType === 'referral_visit' && ev.userId) {
+        s.visitUsers.add(ev.userId);
+      }
+
+      if (ev.eventType === 'referral_complete' && ev.userId) {
+        s.completeUsers.add(ev.userId);
+        if (ev.userEmailLower) s.completeEmails.add(ev.userEmailLower);
+
+        // time to complete
+        const key = `${ev.referrerId}__${ev.userId}`;
+        const vts = firstVisitTs.get(key);
+        const cts = ev.ts?.getTime() ?? null;
+        if (vts !== undefined && cts !== null && cts >= vts) {
+          const hours = (cts - vts) / (1000 * 60 * 60);
+          if (Number.isFinite(hours)) s.ttcHours.push(hours);
+        }
+
+        // diagnosis match / favorite
+        if (ev.userEmailLower && diagUserIndex.has(ev.userEmailLower)) {
+          s.matchedCompletes += 1;
+          const u = diagUserIndex.get(ev.userEmailLower);
+          if (u.hasFavorite) s.matchedFavoriteUsers += 1;
+        }
+      }
+    }
+
+    // finalize
+    const rows = [];
+    for (const s of byRef.values()) {
+      const meta = referrerMeta.get(s.referrerId);
+      const shareToVisit = s.shares > 0 ? s.visitUsers.size / s.shares : null;
+      const visitToComplete = s.visitUsers.size > 0 ? s.completeUsers.size / s.visitUsers.size : null;
+      const shareToComplete = s.shares > 0 ? s.completeUsers.size / s.shares : null;
+      const avgTTC = mean(s.ttcHours);
+      const medTTC = median(s.ttcHours);
+
+      const matchedFavRate = s.matchedCompletes > 0 ? s.matchedFavoriteUsers / s.matchedCompletes : null;
+
+      rows.push({
+        referrerId: s.referrerId,
+        referrerLabel: meta ? (meta.userName || meta.userEmail || s.referrerId) : s.referrerId,
+        shares: s.shares,
+        uniqueVisitors: s.visitUsers.size,
+        uniqueCompletes: s.completeUsers.size,
+        shareToVisit,
+        visitToComplete,
+        shareToComplete,
+        avgTTC,
+        medTTC,
+        // match to diagnosis (only for completes with email)
+        matchedCompletes: s.matchedCompletes,
+        matchedFavoriteUsers: s.matchedFavoriteUsers,
+        matchedFavRate,
+        sharesByPlatform: Object.fromEntries(s.sharesByPlatform.entries())
+      });
+    }
+
+    rows.sort((a, b) => (b.uniqueCompletes - a.uniqueCompletes) || (b.uniqueVisitors - a.uniqueVisitors) || (b.shares - a.shares));
+    return rows;
+  }
+
+  // -----------------------------
+  // Filtering
+  // -----------------------------
+  function withinDate(recDate, fromStr, toStr) {
+    if (!recDate) return false;
+    if (fromStr && recDate < fromStr) return false;
+    if (toStr && recDate > toStr) return false;
+    return true;
+  }
+
+  function filterDiagnosisRecords(records, filter, unit) {
+    let base = records;
+
+    if (unit === 'user') {
+      // build user-level representative records (latest record for each emailLower)
+      const byEmail = new Map();
+      for (const r of records) {
+        const k = r.emailLower ?? `__noemail__${r._row}`;
+        if (!byEmail.has(k)) byEmail.set(k, []);
+        byEmail.get(k).push(r);
+      }
+      const reps = [];
+      for (const recs of byEmail.values()) {
+        recs.sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
+        reps.push(recs[recs.length - 1]);
+      }
+      base = reps;
+    }
+
+    const from = filter.dateFrom || null;
+    const to = filter.dateTo || null;
+    const gender = filter.gender || 'all';
+    const type = filter.type || 'all';
+    const ageMin = filter.ageMin;
+    const ageMax = filter.ageMax;
+    const referral = filter.referral || 'all';
+
+    return base.filter(r => {
+      if (from || to) {
+        const d = r.createdDate;
+        if (!withinDate(d, from, to)) return false;
+      }
+
+      if (gender !== 'all') {
+        if (gender === 'unknown') {
+          if (r.gender === 'female' || r.gender === 'male') return false;
+        } else if (r.gender !== gender) {
+          return false;
+        }
+      }
+
+      if (type !== 'all' && normalizeType(r.type) !== type) return false;
+
+      if (ageMin !== null && ageMin !== undefined && ageMin !== '') {
+        if (!Number.isFinite(r.ageNum) || r.ageNum < Number(ageMin)) return false;
+      }
+      if (ageMax !== null && ageMax !== undefined && ageMax !== '') {
+        if (!Number.isFinite(r.ageNum) || r.ageNum > Number(ageMax)) return false;
+      }
+
+      if (referral !== 'all') {
+        if (referral === 'referred' && !r.referred) return false;
+        if (referral === 'not' && r.referred) return false;
+      }
+
+      return true;
+    });
+  }
+
+  function filterFavorites(diagRecords, diagUsers, filter, unit) {
+    // unit: user => diagUsers latestFavoriteRecord
+    let base = [];
+    if (unit === 'user') {
+      base = diagUsers
+        .filter(u => u.hasFavorite && u.latestFavoriteRecord)
+        .map(u => u.latestFavoriteRecord);
+    } else {
+      base = diagRecords.filter(r => r.interested);
+    }
+
+    const from = filter.dateFrom || null;
+    const to = filter.dateTo || null;
+    const gender = filter.gender || 'all';
+    const type = filter.type || 'all';
+    const ageMin = filter.ageMin;
+    const ageMax = filter.ageMax;
+    const referrer = filter.referrer || 'all';
+
+    return base.filter(r => {
+      if (from || to) {
+        const d = r.createdDate;
+        if (!withinDate(d, from, to)) return false;
+      }
+
+      if (gender !== 'all') {
+        if (gender === 'unknown') {
+          if (r.gender === 'female' || r.gender === 'male') return false;
+        } else if (r.gender !== gender) {
+          return false;
+        }
+      }
+
+      if (type !== 'all' && normalizeType(r.type) !== type) return false;
+
+      if (ageMin !== null && ageMin !== undefined && ageMin !== '') {
+        if (!Number.isFinite(r.ageNum) || r.ageNum < Number(ageMin)) return false;
+      }
+      if (ageMax !== null && ageMax !== undefined && ageMax !== '') {
+        if (!Number.isFinite(r.ageNum) || r.ageNum > Number(ageMax)) return false;
+      }
+
+      if (referrer !== 'all') {
+        if (!r.referrerId || r.referrerId !== referrer) return false;
+      }
+
+      return true;
+    });
+  }
+
+  function filterReferralEvents(refEvents, filter) {
+    const from = filter.dateFrom || null;
+    const to = filter.dateTo || null;
+    const eventType = filter.eventType || 'all';
+    const platform = filter.platform || 'all';
+    const referrer = filter.referrer || 'all';
+
+    return refEvents.filter(ev => {
+      if (from || to) {
+        if (!withinDate(ev.date, from, to)) return false;
+      }
+      if (eventType !== 'all' && ev.eventType !== eventType) return false;
+      if (platform !== 'all') {
+        const p = (ev.platform ?? 'unknown').toString();
+        if (p !== platform) return false;
+      }
+      if (referrer !== 'all') {
+        const rid = ev.referrerId || (ev.eventType === 'share' ? (ev.userId || ev.referrerId) : null);
+        if (rid !== referrer) return false;
+      }
+      return true;
+    });
+  }
+
+  // -----------------------------
+  // Rendering: helpers
+  // -----------------------------
+  function renderKpiCards(containerId, cards) {
+    const container = document.querySelector(containerId);
+    if (!container) return;
+    container.innerHTML = cards.map(c => `
+      <div class="col-6 col-lg-3">
+        <div class="card kpi-card h-100">
+          <div class="card-body">
+            <div class="text-secondary small">${escapeHtml(c.label)}</div>
+            <div class="fs-5 fw-semibold">${escapeHtml(c.value)}</div>
+            ${c.sub ? `<div class="small text-secondary mt-1">${escapeHtml(c.sub)}</div>` : ''}
+          </div>
+        </div>
+      </div>
+    `).join('\n');
+  }
+
+  function plotEmpty(divId, message) {
+    const node = el(divId);
+    if (!node) return;
+    Plotly.react(node, [], {
+      xaxis: { visible: false },
+      yaxis: { visible: false },
+      annotations: [{
+        text: message ?? 'データがありません',
+        x: 0.5, y: 0.5, xref: 'paper', yref: 'paper',
+        showarrow: false
+      }],
+      margin: { l: 30, r: 20, t: 20, b: 30 },
+      height: node.classList.contains('plot-tall') ? 360 : 280
+    }, { displayModeBar: false, responsive: true });
+  }
+
+  function plotBar(divId, x, y, title, yTitle, horiz = false) {
+    const node = el(divId);
+    if (!node) return;
+    const data = [{
+      type: 'bar',
+      x: horiz ? y : x,
+      y: horiz ? x : y,
+      orientation: horiz ? 'h' : 'v',
+      hovertemplate: horiz ? '%{y}<br>%{x}<extra></extra>' : '%{x}<br>%{y}<extra></extra>'
+    }];
+    const layout = {
+      title: { text: title ?? '', font: { size: 12 } },
+      margin: { l: horiz ? 90 : 50, r: 20, t: 30, b: 60 },
+      height: node.classList.contains('plot-tall') ? 360 : 280,
+      xaxis: { automargin: true, title: { text: horiz ? (yTitle ?? '') : '' } },
+      yaxis: { automargin: true, title: { text: horiz ? '' : (yTitle ?? '') } }
+    };
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotLineMulti(divId, series, title) {
+    const node = el(divId);
+    if (!node) return;
+    const data = series.map(s => ({
+      type: 'scatter',
+      mode: 'lines+markers',
+      name: s.name,
+      x: s.x,
+      y: s.y,
+      hovertemplate: '%{x}<br>%{y}<extra></extra>'
+    }));
+    const layout = {
+      title: { text: title ?? '', font: { size: 12 } },
+      margin: { l: 50, r: 20, t: 30, b: 50 },
+      height: node.classList.contains('plot-tall') ? 360 : 280,
+      xaxis: { automargin: true },
+      yaxis: { automargin: true }
+    };
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotHistogram(divId, values, title, xTitle) {
+    const node = el(divId);
+    if (!node) return;
+    const xs = values.filter(v => Number.isFinite(v));
+    if (!xs.length) return plotEmpty(divId, '数値がありません');
+    const data = [{
+      type: 'histogram',
+      x: xs,
+      nbinsx: 20,
+      hovertemplate: '%{x}<br>count=%{y}<extra></extra>'
+    }];
+    const layout = {
+      title: { text: title ?? '', font: { size: 12 } },
+      margin: { l: 50, r: 20, t: 30, b: 50 },
+      height: node.classList.contains('plot-tall') ? 360 : 280,
+      xaxis: { title: { text: xTitle ?? '' }, automargin: true },
+      yaxis: { automargin: true }
+    };
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotBoxByGroup(divId, rows, valueKey, groupKey, topN = 10) {
+    const node = el(divId);
+    if (!node) return;
+    const groups = new Map();
+    for (const r of rows) {
+      const g = (r[groupKey] ?? '(unknown)').toString();
+      const v = r[valueKey];
       if (!Number.isFinite(v)) continue;
-      const g = r.gender || "unknown";
       if (!groups.has(g)) groups.set(g, []);
       groups.get(g).push(v);
     }
-  } else if (groupBy === "ageBin") {
-    const order = ["13-15","16-18","19-22","23+","unknown"];
-    for (const b of order) groups.set(b, []);
+    const counts = Array.from(groups.entries()).map(([g, vs]) => ({ g, n: vs.length, vs }));
+    counts.sort((a, b) => b.n - a.n);
+    const picked = counts.slice(0, topN);
+
+    if (!picked.length) return plotEmpty(divId, '数値がありません');
+
+    const data = picked.map(o => ({
+      type: 'box',
+      name: o.g,
+      y: o.vs,
+      boxpoints: false
+    }));
+
+    const layout = {
+      title: { text: `${valueKey}（${groupKey}別）`, font: { size: 12 } },
+      margin: { l: 50, r: 20, t: 30, b: 80 },
+      height: node.classList.contains('plot-tall') ? 360 : 300,
+      xaxis: { tickangle: -30, automargin: true },
+      yaxis: { automargin: true }
+    };
+
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotHeatmap(divId, labels, matrix, title) {
+    const node = el(divId);
+    if (!node) return;
+    const data = [{
+      type: 'heatmap',
+      z: matrix,
+      x: labels,
+      y: labels,
+      hovertemplate: '%{y} × %{x}<br>%{z:.3f}<extra></extra>'
+    }];
+    const layout = {
+      title: { text: title ?? '', font: { size: 12 } },
+      margin: { l: 90, r: 20, t: 30, b: 90 },
+      height: node.classList.contains('plot-tall') ? 420 : 320,
+    };
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotFunnel(divId, stages, values) {
+    const node = el(divId);
+    if (!node) return;
+    const data = [{
+      type: 'funnel',
+      y: stages,
+      x: values,
+      textinfo: 'value+percent previous'
+    }];
+    const layout = {
+      margin: { l: 20, r: 20, t: 20, b: 20 },
+      height: 280
+    };
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  function plotSankey(divId, edges, labelFnSource, labelFnTarget, minEdge = 1) {
+    const node = el(divId);
+    if (!node) return;
+
+    const filtered = edges.filter(e => e.value >= minEdge);
+    if (!filtered.length) return plotEmpty(divId, 'エッジがありません（min edge を下げてください）');
+
+    const nodes = new Map(); // label -> index
+    function idx(label) {
+      if (!nodes.has(label)) nodes.set(label, nodes.size);
+      return nodes.get(label);
+    }
+
+    const src = [];
+    const tgt = [];
+    const val = [];
+    for (const e of filtered) {
+      const s = labelFnSource(e.referrerId);
+      const t = labelFnTarget(e.userId);
+      src.push(idx(s));
+      tgt.push(idx(t));
+      val.push(e.value);
+    }
+
+    const labels = Array.from(nodes.keys());
+    const data = [{
+      type: 'sankey',
+      arrangement: 'snap',
+      node: { label: labels, pad: 10, thickness: 14 },
+      link: { source: src, target: tgt, value: val }
+    }];
+
+    const layout = {
+      margin: { l: 10, r: 10, t: 10, b: 10 },
+      height: node.classList.contains('plot-tall') ? 420 : 320
+    };
+
+    Plotly.react(node, data, layout, { displayModeBar: false, responsive: true });
+  }
+
+  // -----------------------------
+  // Rendering: DataTables
+  // -----------------------------
+  function destroyDT(instance) {
+    if (!instance) return null;
+    try { instance.destroy(); } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function renderDataTable(tableId, rows, columns, rowClick) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+
+    // reset
+    table.innerHTML = '';
+    const thead = document.createElement('thead');
+    const tr = document.createElement('tr');
+    for (const c of columns) {
+      const th = document.createElement('th');
+      th.textContent = c.title;
+      tr.appendChild(th);
+    }
+    thead.appendChild(tr);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
     for (const r of rows) {
-      const v = r[axis];
-      if (!Number.isFinite(v)) continue;
-      const b = getAgeBinLabel(r.age_num);
-      if (!groups.has(b)) groups.set(b, []);
-      groups.get(b).push(v);
+      const trb = document.createElement('tr');
+      for (const c of columns) {
+        const td = document.createElement('td');
+        td.innerHTML = c.render ? c.render(r) : escapeHtml(r[c.key]);
+        trb.appendChild(td);
+      }
+      if (rowClick) {
+        trb.style.cursor = 'pointer';
+        trb.addEventListener('click', () => rowClick(r));
+      }
+      tbody.appendChild(trb);
     }
-  } else {
-    // groupBy type (top N)
-    const cnt = new Map();
-    for (const r of rows) cnt.set(r.type, (cnt.get(r.type) || 0) + 1);
-    const topTypes = Array.from(cnt.entries()).sort((a, b) => b[1] - a[1]).slice(0, f.axisTopN).map(x => x[0]);
-    for (const t of topTypes) groups.set(t, []);
+    table.appendChild(tbody);
+
+    // init DataTable
+    const dt = $(table).DataTable({
+      paging: true,
+      pageLength: 25,
+      lengthMenu: [10, 25, 50, 100],
+      searching: true,
+      info: true,
+      order: [],
+      scrollX: true
+    });
+
+    return dt;
+  }
+
+  // -----------------------------
+  // Rendering: Dashboard
+  // -----------------------------
+  function renderDashboard() {
+    const diag = state.norm.diagnosis;
+    const users = state.derived.diagnosisUsers;
+    const refEvents = state.derived.refEvents;
+
+    // KPI
+    const diagCount = diag.length;
+    const favRecordCount = diag.filter(r => r.interested).length;
+    const favUserCount = users.filter(u => u.hasFavorite).length;
+    const favRate = diagCount > 0 ? favRecordCount / diagCount : null;
+
+    const shareCount = refEvents.filter(e => e.eventType === 'share').length;
+    const visitCount = refEvents.filter(e => e.eventType === 'referral_visit').length;
+    const completeCount = refEvents.filter(e => e.eventType === 'referral_complete').length;
+
+    const matchedCompletes = refEvents.filter(e => e.eventType === 'referral_complete' && e.userEmailLower && state.derived.diagnosisUserIndex.has(e.userEmailLower)).length;
+
+    renderKpiCards('#dashKpis', [
+      { label: '診断レコード', value: String(diagCount) },
+      { label: 'お気に入り（レコード）', value: String(favRecordCount), sub: formatPct(favRate) },
+      { label: 'お気に入りユーザー', value: String(favUserCount) },
+      { label: '紹介イベント', value: String(refEvents.length), sub: `share ${shareCount} / visit ${visitCount} / complete ${completeCount}` },
+    ]);
+
+    // Trend: diagnosis + favorite by day
+    const byDay = new Map();
+    for (const r of diag) {
+      if (!r.createdDate) continue;
+      if (!byDay.has(r.createdDate)) byDay.set(r.createdDate, { date: r.createdDate, diag: 0, fav: 0 });
+      const d = byDay.get(r.createdDate);
+      d.diag += 1;
+      if (r.interested) d.fav += 1;
+    }
+    const days = Array.from(byDay.values()).sort((a, b) => a.date.localeCompare(b.date));
+    const x = days.map(d => d.date);
+    const y1 = days.map(d => d.diag);
+    const y2 = days.map(d => d.fav);
+    if (x.length) {
+      plotLineMulti('chartDashDiagnosisTrend', [
+        { name: 'diagnosis', x, y: y1 },
+        { name: 'favorites', x, y: y2 },
+      ], '');
+    } else {
+      plotEmpty('chartDashDiagnosisTrend', '診断データがありません');
+    }
+
+    // Trend: referral events by day
+    const rd = state.derived.refDaily;
+    if (rd.length) {
+      plotLineMulti('chartDashReferralTrend', [
+        { name: 'share', x: rd.map(d => d.date), y: rd.map(d => d.share) },
+        { name: 'visit', x: rd.map(d => d.date), y: rd.map(d => d.referral_visit) },
+        { name: 'complete', x: rd.map(d => d.date), y: rd.map(d => d.referral_complete) },
+      ], '');
+    } else {
+      plotEmpty('chartDashReferralTrend', '紹介イベントがありません');
+    }
+
+    // Profiles
+    el('diagProfile').innerHTML = makeProfileTable(state.raw.diagnosis, state.ui.hideUnnamed);
+    el('refProfile').innerHTML = makeProfileTable(state.raw.referral_events, state.ui.hideUnnamed);
+  }
+
+  // -----------------------------
+  // Rendering: Diagnosis tab
+  // -----------------------------
+  function getDiagFilter() {
+    return {
+      dateFrom: el('diagDateFrom').value || null,
+      dateTo: el('diagDateTo').value || null,
+      gender: el('diagGender').value || 'all',
+      type: el('diagType').value || 'all',
+      ageMin: el('diagAgeMin').value,
+      ageMax: el('diagAgeMax').value,
+      referral: el('diagReferral').value || 'all'
+    };
+  }
+
+  function renderDiagnosisTab() {
+    const unit = el('diagUnit').value || 'record';
+    const filter = getDiagFilter();
+    const rows = filterDiagnosisRecords(state.norm.diagnosis, filter, unit);
+
+    // KPI
+    const total = rows.length;
+    const fav = rows.filter(r => r.interested).length;
+    const rate = total > 0 ? fav / total : null;
+    const uniqEmail = uniqueCount(rows.filter(r => r.emailLower), r => r.emailLower);
+    const ageMed = median(rows.map(r => r.ageNum));
+    const femaleRate = total > 0 ? rows.filter(r => r.gender === 'female').length / total : null;
+
+    const referredRate = total > 0 ? rows.filter(r => r.referred).length / total : null;
+
+    renderKpiCards('#diagKpis', [
+      { label: unit === 'user' ? 'ユーザー数' : '件数', value: String(total) },
+      { label: 'お気に入り', value: String(fav), sub: formatPct(rate) },
+      { label: 'ユニークemail', value: String(uniqEmail) },
+      { label: '女性比率', value: formatPct(femaleRate), sub: `紹介あり ${formatPct(referredRate)}` },
+    ]);
+
+    // Type dist
+    const typeCounts = Array.from(groupCount(rows, r => normalizeType(r.type)).entries())
+      .map(([type, c]) => ({ type, c }))
+      .sort((a, b) => b.c - a.c)
+      .slice(0, 20);
+    if (typeCounts.length) {
+      plotBar('chartDiagTypeCount', typeCounts.map(d => d.type), typeCounts.map(d => d.c), '', 'count', true);
+    } else plotEmpty('chartDiagTypeCount', 'データがありません');
+
+    // Fav rate by type: compute within the (unfiltered?) Actually use rows but favorites vs all by type
+    const byType = new Map();
     for (const r of rows) {
-      if (!groups.has(r.type)) continue;
-      const v = r[axis];
-      if (!Number.isFinite(v)) continue;
-      groups.get(r.type).push(v);
+      const t = normalizeType(r.type);
+      if (!byType.has(t)) byType.set(t, { t, n: 0, f: 0 });
+      const o = byType.get(t);
+      o.n += 1;
+      if (r.interested) o.f += 1;
     }
-  }
+    const favRateByType = Array.from(byType.values())
+      .filter(o => o.n >= 5) // avoid tiny
+      .map(o => ({ t: o.t, rate: o.f / o.n, n: o.n }))
+      .sort((a, b) => b.rate - a.rate)
+      .slice(0, 20);
 
-  // build traces
-  const traces = [];
-  for (const [k, vals] of groups.entries()) {
-    if (!vals || vals.length === 0) continue;
-    traces.push({ type: "box", name: k, y: vals });
-  }
-  if (traces.length === 0) {
-    $("plotDiagAxisBox").innerHTML = `<div class="text-muted small">表示できるデータがありません</div>`;
-    return;
-  }
-
-  Plotly.newPlot("plotDiagAxisBox", traces, {
-    margin: {l: 50, r: 10, t: 10, b: 120},
-    yaxis: { title: axis, range: [0, 100] },
-    boxmode: "group"
-  }, {displayModeBar: true, responsive: true});
-}
-
-function renderDiagnosisCorr(rows) {
-  const cols = ["axisA","axisB","axisC","axisD","age_num","interested"];
-  const { cols: c, z } = buildCorrelationMatrix(rows, cols);
-
-  // If everything is null, show message
-  const any = z.flat().some(v => v !== null);
-  if (!any) {
-    $("plotDiagCorr").innerHTML = `<div class="text-muted small">相関を計算できるデータが不足しています</div>`;
-    return;
-  }
-
-  Plotly.newPlot("plotDiagCorr", [{
-    type: "heatmap",
-    x: c,
-    y: c,
-    z,
-    zmin: -1,
-    zmax: 1
-  }], {
-    margin: {l: 80, r: 10, t: 10, b: 80},
-  }, {displayModeBar: true, responsive: true});
-}
-
-function renderDiagnosisInterestedSegments(rows) {
-  // by age bin
-  const bins = ["13-15","16-18","19-22","23+","unknown"];
-  const m = new Map(bins.map(b => [b, { n: 0, interested: 0 }]));
-  for (const r of rows) {
-    const b = getAgeBinLabel(r.age_num);
-    if (!m.has(b)) m.set(b, { n: 0, interested: 0 });
-    const o = m.get(b);
-    o.n++;
-    o.interested += (r.interested || 0);
-  }
-  const xA = bins;
-  const yA = bins.map(b => {
-    const o = m.get(b);
-    return o && o.n ? (o.interested / o.n) : 0;
-  });
-
-  Plotly.newPlot("plotDiagInterestedByAge", [{
-    type: "bar",
-    x: xA,
-    y: yA,
-    text: yA.map(v => (v * 100).toFixed(1) + "%"),
-    textposition: "auto",
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 80},
-    yaxis: { title: "Interested rate", tickformat: ".0%", range: [0, 1] },
-    xaxis: { title: "age bin" },
-  }, {displayModeBar: true, responsive: true});
-
-  // by gender
-  const genders = ["female","male","unknown"];
-  const mg = new Map(genders.map(g => [g, { n: 0, interested: 0 }]));
-  for (const r of rows) {
-    const g = r.gender || "unknown";
-    if (!mg.has(g)) mg.set(g, { n: 0, interested: 0 });
-    const o = mg.get(g);
-    o.n++;
-    o.interested += (r.interested || 0);
-  }
-  const xG = genders;
-  const yG = genders.map(g => {
-    const o = mg.get(g);
-    return o && o.n ? (o.interested / o.n) : 0;
-  });
-
-  Plotly.newPlot("plotDiagInterestedByGender", [{
-    type: "bar",
-    x: xG,
-    y: yG,
-    text: yG.map(v => (v * 100).toFixed(1) + "%"),
-    textposition: "auto",
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 80},
-    yaxis: { title: "Interested rate", tickformat: ".0%", range: [0, 1] },
-    xaxis: { title: "gender" },
-  }, {displayModeBar: true, responsive: true});
-}
-
-function renderDiagnosisDominantAxis(rows) {
-  const cats = ["A","B","C","D"];
-  const m = new Map(cats.map(c => [c, { n: 0, interested: 0 }]));
-  for (const r of rows) {
-    const k = dominantAxisLabel(r);
-    if (!k) continue;
-    const o = m.get(k);
-    o.n++;
-    o.interested += (r.interested || 0);
-  }
-  const x = cats;
-  const y = cats.map(c => m.get(c).n);
-  const rate = cats.map(c => {
-    const o = m.get(c);
-    return o.n ? (o.interested / o.n) : 0;
-  });
-
-  Plotly.newPlot("plotDiagDominantAxis", [{
-    type: "bar",
-    x,
-    y,
-    text: rate.map(v => "rate " + (v * 100).toFixed(1) + "%"),
-    textposition: "auto",
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 60},
-    xaxis: { title: "dominant axis" },
-    yaxis: { title: "count" }
-  }, {displayModeBar: true, responsive: true});
-}
-
-function renderDiagnosisQuestion(rows, qKey) {
-  const histDiv = $("plotDiagQHist");
-  const meanDiv = $("plotDiagQMeanByType");
-  if (!histDiv || !meanDiv) return;
-
-  if (!qKey) {
-    histDiv.innerHTML = `<div class="text-muted small">answers のキーが見つかりません</div>`;
-    meanDiv.innerHTML = `<div class="text-muted small">answers のキーが見つかりません</div>`;
-    ["diagQMeanInterested","diagQMeanNotInterested","diagQMeanDiff"].forEach(id => { if ($(id)) $(id).textContent = "-"; });
-    return;
-  }
-
-  const vals = [];
-  const byType = new Map();
-  let sum1 = 0, n1 = 0, sum0 = 0, n0 = 0;
-
-  for (const r of rows) {
-    if (!r.answers) continue;
-    const v = safeNumber(r.answers[qKey]);
-    if (v === null) continue;
-    vals.push(v);
-
-    const t = r.type || "(missing)";
-    if (!byType.has(t)) byType.set(t, { sum: 0, n: 0 });
-    const o = byType.get(t);
-    o.sum += v; o.n++;
-
-    if (r.interested === 1) { sum1 += v; n1++; }
-    else { sum0 += v; n0++; }
-  }
-
-  if (vals.length === 0) {
-    histDiv.innerHTML = `<div class="text-muted small">フィルタ条件では ${qKey} の回答が取得できません</div>`;
-    meanDiv.innerHTML = `<div class="text-muted small">フィルタ条件では ${qKey} の回答が取得できません</div>`;
-    ["diagQMeanInterested","diagQMeanNotInterested","diagQMeanDiff"].forEach(id => { if ($(id)) $(id).textContent = "-"; });
-    return;
-  }
-
-  // Histogram
-  Plotly.newPlot("plotDiagQHist", [{
-    type: "histogram",
-    x: vals,
-    xbins: { start: 0.5, end: 7.5, size: 1 },
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 60},
-    xaxis: { title: qKey, dtick: 1 },
-    yaxis: { title: "count" }
-  }, {displayModeBar: true, responsive: true});
-
-  // Mean by type (top 15 by n)
-  const arr = Array.from(byType.entries())
-    .map(([t, o]) => ({ type: t, n: o.n, mean: o.n ? o.sum / o.n : 0 }))
-    .sort((a, b) => b.n - a.n)
-    .slice(0, 15);
-
-  Plotly.newPlot("plotDiagQMeanByType", [{
-    type: "bar",
-    x: arr.map(o => o.type),
-    y: arr.map(o => o.mean),
-    text: arr.map(o => o.mean.toFixed(2)),
-    textposition: "auto",
-  }], {
-    margin: {l: 50, r: 10, t: 10, b: 120},
-    xaxis: { tickangle: -45, title: "type" },
-    yaxis: { title: `mean(${qKey})`, range: [0, 7.5] },
-  }, {displayModeBar: true, responsive: true});
-
-  const m1 = n1 ? (sum1 / n1) : null;
-  const m0 = n0 ? (sum0 / n0) : null;
-  const diff = (m1 !== null && m0 !== null) ? (m1 - m0) : null;
-
-  if ($("diagQMeanInterested")) $("diagQMeanInterested").textContent = (m1 === null ? "-" : m1.toFixed(2));
-  if ($("diagQMeanNotInterested")) $("diagQMeanNotInterested").textContent = (m0 === null ? "-" : m0.toFixed(2));
-  if ($("diagQMeanDiff")) $("diagQMeanDiff").textContent = (diff === null ? "-" : diff.toFixed(2));
-}
-
-function renderDiagnosisQuality(rows) {
-  const n = rows.length;
-  if (n === 0) {
-    ["diagQualityDupEmail","diagQualityBadAge","diagQualityAxisOut","diagQualityNoDate"].forEach(id => { if ($(id)) $(id).textContent = "-"; });
-    return;
-  }
-
-  // duplicate emails
-  const em = new Map();
-  for (const r of rows) {
-    if (isMissing(r.email)) continue;
-    const e = String(r.email);
-    em.set(e, (em.get(e) || 0) + 1);
-  }
-  let dupEmails = 0;
-  let extraRows = 0;
-  let maxDup = 0;
-  for (const c of em.values()) {
-    if (c > 1) {
-      dupEmails++;
-      extraRows += (c - 1);
-      maxDup = Math.max(maxDup, c);
+    if (favRateByType.length) {
+      plotBar('chartDiagTypeFavRate', favRateByType.map(d => `${d.t} (n=${d.n})`), favRateByType.map(d => (d.rate * 100).toFixed(1)), '', 'fav%', true);
+    } else {
+      plotEmpty('chartDiagTypeFavRate', '十分なデータがありません（各Type n>=5）');
     }
-  }
 
-  // bad age parse: age_raw exists but age_num is null
-  let badAge = 0;
-  for (const r of rows) {
-    if (!isMissing(r.age_raw) && (r.age_num === null || r.age_num === undefined || !Number.isFinite(r.age_num))) badAge++;
-  }
-
-  // axis out of range
-  let axisOut = 0;
-  for (const r of rows) {
-    const xs = [r.axisA, r.axisB, r.axisC, r.axisD].filter(v => v !== null && v !== undefined && Number.isFinite(v));
-    if (xs.some(v => v < 0 || v > 100)) axisOut++;
-  }
-
-  // no createdAt
-  const noDate = rows.filter(r => !r.createdDay).length;
-
-  if ($("diagQualityDupEmail")) $("diagQualityDupEmail").textContent = `${dupEmails.toLocaleString()}（余剰${extraRows.toLocaleString()} / 最大${maxDup}）`;
-  if ($("diagQualityBadAge")) $("diagQualityBadAge").textContent = badAge.toLocaleString();
-  if ($("diagQualityAxisOut")) $("diagQualityAxisOut").textContent = axisOut.toLocaleString();
-  if ($("diagQualityNoDate")) $("diagQualityNoDate").textContent = noDate.toLocaleString();
-}
-
-function wireEvents() {
-  $("fileInput").addEventListener("change", async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      await loadWorkbookFromFile(file);
-    } catch (err) {
-      console.error(err);
-      setStatus("読み込みに失敗しました（コンソールも確認してください）", "danger");
-      alert("読み込みに失敗しました。ファイル形式や破損を確認してください。");
+    // Corr heatmap
+    const labels = ['axisA', 'axisB', 'axisC', 'axisD', 'age', 'interested'];
+    const vectors = {
+      axisA: rows.map(r => r.axisA),
+      axisB: rows.map(r => r.axisB),
+      axisC: rows.map(r => r.axisC),
+      axisD: rows.map(r => r.axisD),
+      age: rows.map(r => r.ageNum),
+      interested: rows.map(r => r.interested ? 1 : 0)
+    };
+    const mat = [];
+    for (const a of labels) {
+      const row = [];
+      for (const b of labels) {
+        const c = pearson(vectors[a], vectors[b]);
+        row.push(c === null ? null : c);
+      }
+      mat.push(row);
     }
-  });
+    plotHeatmap('chartDiagCorr', labels, mat, '');
 
-  $("maskPII").addEventListener("change", () => {
-    if (!state.workbook) return;
-    renderSheetTable();
-    renderProfile();
-    renderReferralDeepDive();
-  });
-  $("showJsonCols").addEventListener("change", () => {
-    if (!state.workbook) return;
-    renderOverview();
-    populateSheetSelects();
-    setCurrentSheet(state.currentSheet || state.sheetOrder[0]);
-    renderReferralDeepDive();
-  });
-  $("showUnnamedCols").addEventListener("change", () => {
-    if (!state.workbook) return;
-    renderOverview();
-    populateSheetSelects();
-    setCurrentSheet(state.currentSheet || state.sheetOrder[0]);
-    renderReferralDeepDive();
-  });
+    // Advanced: axis distribution
+    renderDiagnosisAdvanced(rows, unit);
 
-  $("sheetSelect").addEventListener("change", () => {
-    renderSheetTable();
-  });
+    // Raw table
+    renderDiagnosisTable(rows, unit);
+  }
 
-  $("btnRefreshView").addEventListener("click", () => {
-    renderSheetTable();
-  });
-
-  $("btnGoProfile").addEventListener("click", () => {
-    const tabEl = document.querySelector('#tab-profile');
-    const tab = new bootstrap.Tab(tabEl);
-    tab.show();
-    $("profileSheetSelect").value = $("sheetSelect").value;
-    renderProfile();
-  });
-
-  $("btnGoCharts").addEventListener("click", () => {
-    const tabEl = document.querySelector('#tab-charts');
-    const tab = new bootstrap.Tab(tabEl);
-    tab.show();
-    $("chartsSheetSelect").value = $("sheetSelect").value;
-    syncChartColumns();
-  });
-
-  $("profileSheetSelect").addEventListener("change", () => renderProfile());
-  $("btnProfileRecalc").addEventListener("click", () => renderProfile());
-
-  $("chartsSheetSelect").addEventListener("change", () => syncChartColumns());
-  $("chartType").addEventListener("change", () => autoPickColumns());
-  $("btnAutoPick").addEventListener("click", () => autoPickColumns());
-  $("btnDrawChart").addEventListener("click", () => drawChart());
-
-  $("exportSheetSelect").addEventListener("change", () => {});
-  $("btnExportCsv").addEventListener("click", () => exportSheet("csv"));
-  $("btnExportJson").addEventListener("click", () => exportSheet("json"));
-  // Referral deep dive
-  const refApply = $("btnRefApply");
-  if (refApply) refApply.addEventListener("click", () => {
-    if (!state.workbook) return;
-    renderReferralDeepDive();
-  });
-
-  const refReset = $("btnRefReset");
-  if (refReset) refReset.addEventListener("click", () => {
-    if (!state.workbook) return;
-    // reset to full bounds
-    const eventsAll = getReferralEventsAll();
-    const b = computeEventDateBounds(eventsAll);
-    if (b.min && b.max) {
-      const s = $("refStartDate");
-      const e = $("refEndDate");
-      if (s) s.value = toISODateString(b.min);
-      if (e) e.value = toISODateString(b.max);
+  function renderDiagnosisAdvanced(rows, unit) {
+    // axis chart
+    const axisKey = el('diagAxisPick').value || 'axisA';
+    const view = el('diagAxisView').value || 'hist';
+    if (view === 'hist') {
+      plotHistogram('chartDiagAxis', rows.map(r => r[axisKey]), `${axisKey} 分布`, axisKey);
+    } else {
+      plotBoxByGroup('chartDiagAxis', rows, axisKey, 'type', 10);
     }
-    renderReferralDeepDive();
-  });
 
-  const refSel = $("referrerSelect");
-  if (refSel) refSel.addEventListener("change", () => {
-    state.referralSelectedReferrer = refSel.value;
-    renderReferrerDetail();
-  });
+    // answer diff (favorites vs non)
+    const favRows = rows.filter(r => r.interested);
+    const nonRows = rows.filter(r => !r.interested);
 
-  const refDetailRefresh = $("btnRefDetailRefresh");
-  if (refDetailRefresh) refDetailRefresh.addEventListener("click", () => {
-    renderReferrerDetail();
-  });
+    const allKeys = new Set();
+    for (const r of rows) Object.keys(r.answers || {}).forEach(k => allKeys.add(k));
+    const keys = Array.from(allKeys).sort();
 
-  const sankeyKind = $("refSankeyKind");
-  if (sankeyKind) sankeyKind.addEventListener("change", () => drawReferralSankey());
+    if (!keys.length) {
+      plotEmpty('chartDiagAnswerDiff', 'answers がありません');
+      setText('diagAnswersHint', 'raw_json / answers_json に answers が無い場合、このグラフは表示できません。');
+    } else {
+      setText('diagAnswersHint', '');
+      const diffs = [];
+      for (const k of keys) {
+        const fv = favRows.map(r => r.answers?.[k]).filter(v => Number.isFinite(v));
+        const nv = nonRows.map(r => r.answers?.[k]).filter(v => Number.isFinite(v));
+        if (fv.length < 5 || nv.length < 5) continue;
+        const d = mean(fv) - mean(nv);
+        diffs.push({ k, d });
+      }
+      diffs.sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
+      const top = diffs.slice(0, 10);
+      if (!top.length) {
+        plotEmpty('chartDiagAnswerDiff', '有効な answers が不足しています');
+      } else {
+        plotBar('chartDiagAnswerDiff', top.map(o => o.k), top.map(o => o.d.toFixed(2)), '', 'mean差', true);
+      }
+    }
 
-  const sankeyVariant = $("refSankeyVariant");
-  if (sankeyVariant) sankeyVariant.addEventListener("change", () => drawReferralSankey());
+    // quality
+    renderDiagQuality(rows);
 
-  const sankeyMin = $("refSankeyMinValue");
-  if (sankeyMin) {
-    sankeyMin.addEventListener("change", () => drawReferralSankey());
-    sankeyMin.addEventListener("keyup", (e) => {
-      if (e.key === "Enter") drawReferralSankey();
+    // signals table (numeric)
+    renderSignalTable('diagSignalTable', rows, unit);
+  }
+
+  function renderDiagQuality(rows) {
+    const total = rows.length;
+    if (!total) {
+      el('diagQuality').innerHTML = '<div class="text-secondary small">データがありません</div>';
+      return;
+    }
+    const missingEmail = rows.filter(r => !r.emailLower).length;
+    const missingDate = rows.filter(r => !r.createdAt).length;
+    const missingAge = rows.filter(r => !Number.isFinite(r.ageNum)).length;
+    const outAxis = rows.filter(r => {
+      const axes = [r.axisA, r.axisB, r.axisC, r.axisD];
+      return axes.some(v => Number.isFinite(v) && (v < 0 || v > 100));
+    }).length;
+
+    // duplicate email (within filtered rows)
+    const counts = groupCount(rows.filter(r => r.emailLower), r => r.emailLower);
+    let dupEmails = 0;
+    for (const c of counts.values()) if (c >= 2) dupEmails += 1;
+
+    el('diagQuality').innerHTML = `
+      <div class="small">
+        <div>createdAt 欠損: <span class="fw-semibold">${missingDate}</span> / ${total}</div>
+        <div>email 欠損: <span class="fw-semibold">${missingEmail}</span> / ${total}</div>
+        <div>age 数値化不可: <span class="fw-semibold">${missingAge}</span> / ${total}</div>
+        <div>axis 範囲外（0〜100以外）: <span class="fw-semibold">${outAxis}</span> / ${total}</div>
+        <div>email 重複（ユニークemailのうち重複あり）: <span class="fw-semibold">${dupEmails}</span></div>
+      </div>
+    `;
+  }
+
+  function renderSignalTable(containerId, rows, unit) {
+    const container = el(containerId);
+    if (!container) return;
+
+    const fav = rows.filter(r => r.interested);
+    const non = rows.filter(r => !r.interested);
+
+    if (fav.length < 10 || non.length < 10) {
+      container.innerHTML = '<div class="text-secondary small">お気に入り/非お気に入りの件数が不足しています。</div>';
+      return;
+    }
+
+    // numeric features: age, axes, answers
+    const featureKeys = ['ageNum', 'axisA', 'axisB', 'axisC', 'axisD'];
+
+    // include answers keys
+    const ansKeys = new Set();
+    for (const r of rows) Object.keys(r.answers || {}).forEach(k => ansKeys.add(k));
+    const ansList = Array.from(ansKeys).sort();
+    for (const k of ansList) featureKeys.push(`ans:${k}`);
+
+    const rowsOut = [];
+    for (const k of featureKeys) {
+      let fvals = [];
+      let nvals = [];
+      if (k.startsWith('ans:')) {
+        const ak = k.slice(4);
+        fvals = fav.map(r => r.answers?.[ak]).filter(v => Number.isFinite(v));
+        nvals = non.map(r => r.answers?.[ak]).filter(v => Number.isFinite(v));
+      } else {
+        fvals = fav.map(r => r[k]).filter(v => Number.isFinite(v));
+        nvals = non.map(r => r[k]).filter(v => Number.isFinite(v));
+      }
+      if (fvals.length < 10 || nvals.length < 10) continue;
+      const mf = mean(fvals);
+      const mn = mean(nvals);
+      const diff = mf - mn;
+      const d = cohenD(fvals, nvals);
+      rowsOut.push({
+        feature: k.startsWith('ans:') ? k.slice(4) : k.replace('Num',''),
+        mean_fav: mf,
+        mean_non: mn,
+        diff,
+        effect_d: d,
+        n_fav: fvals.length,
+        n_non: nvals.length
+      });
+    }
+
+    rowsOut.sort((a, b) => Math.abs(b.effect_d ?? 0) - Math.abs(a.effect_d ?? 0));
+    const top = rowsOut.slice(0, 15);
+
+    if (!top.length) {
+      container.innerHTML = '<div class="text-secondary small">有効な数値特徴が不足しています。</div>';
+      return;
+    }
+
+    const html = [];
+    html.push('<div class="table-responsive"><table class="table table-sm table-bordered align-middle">');
+    html.push('<thead><tr><th>特徴</th><th>平均（fav）</th><th>平均（non）</th><th>差</th><th>d</th><th>n</th></tr></thead><tbody>');
+    for (const r of top) {
+      html.push(`<tr>
+        <td class="text-nowrap">${escapeHtml(r.feature)}</td>
+        <td>${r.mean_fav.toFixed(2)}</td>
+        <td>${r.mean_non.toFixed(2)}</td>
+        <td>${r.diff.toFixed(2)}</td>
+        <td>${(r.effect_d ?? 0).toFixed(2)}</td>
+        <td class="small text-secondary">${r.n_fav}/${r.n_non}</td>
+      </tr>`);
+    }
+    html.push('</tbody></table></div>');
+    container.innerHTML = html.join('\n');
+  }
+
+  function renderDiagnosisTable(rows, unit) {
+    // choose columns
+    const cols = [
+      { key: 'createdAtRaw', title: 'createdAt' },
+      { key: 'type', title: 'type' },
+      { key: 'gender', title: 'gender' },
+      { key: 'ageRaw', title: 'age' },
+      { key: 'axisA', title: 'axisA' },
+      { key: 'axisB', title: 'axisB' },
+      { key: 'axisC', title: 'axisC' },
+      { key: 'axisD', title: 'axisD' },
+      { key: 'interested', title: 'favorite', render: r => r.interested ? '1' : '0' },
+      { key: 'referred', title: 'referred', render: r => r.referred ? '1' : '0' },
+      { key: 'referrerId', title: 'referrer', render: r => {
+        if (!r.referrerId) return '';
+        return state.ui.maskPII ? maskId('r', r.referrerId) : escapeHtml(r.referrerId);
+      }},
+      { key: 'email', title: 'email', render: r => {
+        if (!r.email) return '';
+        return state.ui.maskPII ? maskId('u', r.emailLower || r.email) : escapeHtml(r.email);
+      }},
+      { key: '_row', title: 'row' }
+    ];
+
+    state.dt.tableDiagnosis = destroyDT(state.dt.tableDiagnosis);
+    state.dt.tableDiagnosis = renderDataTable('tableDiagnosis', rows, cols);
+  }
+
+  // -----------------------------
+  // Rendering: Favorites tab
+  // -----------------------------
+  function getFavFilter() {
+    return {
+      dateFrom: el('favDateFrom').value || null,
+      dateTo: el('favDateTo').value || null,
+      gender: el('favGender').value || 'all',
+      type: el('favType').value || 'all',
+      ageMin: el('favAgeMin').value,
+      ageMax: el('favAgeMax').value,
+      referrer: el('favReferrer').value || 'all'
+    };
+  }
+
+  function buildNonFavoriteBaseline(unit, filter) {
+    // for comparison in Favorites tab:
+    // unit=user => users with no favorite -> latestRecord
+    // unit=record => diagnosis records with interested=false
+    const diag = state.norm.diagnosis;
+    if (unit === 'user') {
+      const users = state.derived.diagnosisUsers.filter(u => !u.hasFavorite && u.latestRecord);
+      // apply filter on latestRecord
+      return users.map(u => u.latestRecord).filter(r => {
+        // reuse favorites filter logic but without referrer restriction (still meaningful though)
+        const f = { ...filter, referrer: 'all' };
+        return filterFavorites([r], [{hasFavorite:false, latestFavoriteRecord:null}], f, 'record').length > 0;
+      });
+    }
+    // record
+    return diag.filter(r => !r.interested).filter(r => {
+      // use same filter but ignoring referrer filter
+      const f = { ...filter, referrer: 'all' };
+      return filterFavorites([r], [], f, 'record').length > 0;
     });
   }
-  // Leaderboard row click -> detail select (event delegation)
-  const refTable = $("referrerTable");
-  if (refTable) refTable.addEventListener("click", (e) => {
-    const tr = e.target.closest("tr");
-    if (!tr) return;
-    const rid = tr.getAttribute("data-referrer-id");
-    if (!rid) return;
-    state.referralSelectedReferrer = rid;
-    const sel = $("referrerSelect");
-    if (sel) sel.value = rid;
-    renderReferrerDetail();
-  });
-}
 
-wireEvents();
+  function renderFavoritesTab() {
+    const unit = el('favUnit').value || 'user';
+    const filter = getFavFilter();
+
+    const favRows = filterFavorites(state.norm.diagnosis, state.derived.diagnosisUsers, filter, unit);
+    const nonRows = buildNonFavoriteBaseline(unit, filter);
+
+    // KPI
+    const favN = favRows.length;
+    const allN = unit === 'user'
+      ? state.derived.diagnosisUsers.filter(u => u.emailLower).length
+      : state.norm.diagnosis.length;
+
+    const favRate = allN > 0 ? favN / allN : null;
+
+    const referredFav = favRows.filter(r => r.referred).length;
+    const referredRate = favN > 0 ? referredFav / favN : null;
+
+    const topType = (() => {
+      const m = groupCount(favRows, r => normalizeType(r.type));
+      const arr = Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
+      return arr.length ? `${arr[0][0]} (${arr[0][1]})` : '—';
+    })();
+
+    renderKpiCards('#favKpis', [
+      { label: unit === 'user' ? 'お気に入りユーザー' : 'お気に入りレコード', value: String(favN), sub: `${formatPct(favRate)}（全体比）` },
+      { label: '紹介あり（complete）', value: String(referredFav), sub: formatPct(referredRate) },
+      { label: 'Top Type', value: topType },
+      { label: '比較母数（非お気に入り）', value: String(nonRows.length) }
+    ]);
+
+    // Trend
+    const byDay = new Map();
+    for (const r of favRows) {
+      if (!r.createdDate) continue;
+      byDay.set(r.createdDate, (byDay.get(r.createdDate) ?? 0) + 1);
+    }
+    const days = Array.from(byDay.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+    if (days.length) {
+      plotLineMulti('chartFavTrend', [{ name: 'favorites', x: days.map(d => d[0]), y: days.map(d => d[1]) }], '');
+    } else plotEmpty('chartFavTrend', 'データがありません');
+
+    // Type distribution
+    const typeCounts = Array.from(groupCount(favRows, r => normalizeType(r.type)).entries())
+      .map(([type, c]) => ({ type, c }))
+      .sort((a, b) => b.c - a.c)
+      .slice(0, 20);
+    if (typeCounts.length) {
+      plotBar('chartFavTypeCount', typeCounts.map(d => d.type), typeCounts.map(d => d.c), '', 'count', true);
+    } else plotEmpty('chartFavTypeCount', 'データがありません');
+
+    // Axis diff
+    const axisKeys = ['axisA', 'axisB', 'axisC', 'axisD'];
+    const diffs = axisKeys.map(k => {
+      const fv = favRows.map(r => r[k]).filter(v => Number.isFinite(v));
+      const nv = nonRows.map(r => r[k]).filter(v => Number.isFinite(v));
+      const d = (mean(fv) ?? 0) - (mean(nv) ?? 0);
+      return { k, d };
+    });
+    plotBar('chartFavAxisDiff', diffs.map(o => o.k), diffs.map(o => o.d.toFixed(2)), '', 'mean差', true);
+
+    // Answer diff top 10
+    const allKeys = new Set();
+    for (const r of favRows) Object.keys(r.answers || {}).forEach(k => allKeys.add(k));
+    for (const r of nonRows) Object.keys(r.answers || {}).forEach(k => allKeys.add(k));
+    const keys = Array.from(allKeys).sort();
+
+    if (!keys.length) {
+      plotEmpty('chartFavAnswerDiff', 'answers がありません');
+      setText('favAnswersHint', 'raw_json / answers_json に answers が無い場合、このグラフは表示できません。');
+    } else {
+      setText('favAnswersHint', '');
+      const out = [];
+      for (const k of keys) {
+        const fv = favRows.map(r => r.answers?.[k]).filter(v => Number.isFinite(v));
+        const nv = nonRows.map(r => r.answers?.[k]).filter(v => Number.isFinite(v));
+        if (fv.length < 10 || nv.length < 10) continue;
+        out.push({ k, d: mean(fv) - mean(nv) });
+      }
+      out.sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
+      const top = out.slice(0, 10);
+      if (!top.length) plotEmpty('chartFavAnswerDiff', '有効な answers が不足しています');
+      else plotBar('chartFavAnswerDiff', top.map(o => o.k), top.map(o => o.d.toFixed(2)), '', 'mean差', true);
+    }
+
+    // Signal table
+    renderFavSignalTable(favRows, nonRows);
+
+    // Favorites table
+    renderFavoritesTable(favRows, unit);
+  }
+
+  function renderFavSignalTable(favRows, nonRows) {
+    const container = el('favSignalTable');
+    if (!container) return;
+
+    if (favRows.length < 10 || nonRows.length < 10) {
+      container.innerHTML = '<div class="text-secondary small">比較に必要な件数が不足しています。</div>';
+      return;
+    }
+
+    const featureKeys = ['ageNum', 'axisA', 'axisB', 'axisC', 'axisD'];
+
+    const ansKeys = new Set();
+    for (const r of favRows) Object.keys(r.answers || {}).forEach(k => ansKeys.add(k));
+    for (const r of nonRows) Object.keys(r.answers || {}).forEach(k => ansKeys.add(k));
+    const ansList = Array.from(ansKeys).sort();
+    for (const k of ansList) featureKeys.push(`ans:${k}`);
+
+    const rowsOut = [];
+    for (const k of featureKeys) {
+      let fvals = [];
+      let nvals = [];
+      if (k.startsWith('ans:')) {
+        const ak = k.slice(4);
+        fvals = favRows.map(r => r.answers?.[ak]).filter(v => Number.isFinite(v));
+        nvals = nonRows.map(r => r.answers?.[ak]).filter(v => Number.isFinite(v));
+      } else {
+        fvals = favRows.map(r => r[k]).filter(v => Number.isFinite(v));
+        nvals = nonRows.map(r => r[k]).filter(v => Number.isFinite(v));
+      }
+      if (fvals.length < 10 || nvals.length < 10) continue;
+      const mf = mean(fvals);
+      const mn = mean(nvals);
+      const diff = mf - mn;
+      const d = cohenD(fvals, nvals);
+      rowsOut.push({
+        feature: k.startsWith('ans:') ? k.slice(4) : k.replace('Num',''),
+        mean_fav: mf,
+        mean_non: mn,
+        diff,
+        effect_d: d,
+        n_fav: fvals.length,
+        n_non: nvals.length
+      });
+    }
+
+    rowsOut.sort((a, b) => Math.abs(b.effect_d ?? 0) - Math.abs(a.effect_d ?? 0));
+    const top = rowsOut.slice(0, 20);
+
+    if (!top.length) {
+      container.innerHTML = '<div class="text-secondary small">有効な数値特徴が不足しています。</div>';
+      return;
+    }
+
+    const html = [];
+    html.push('<div class="table-responsive"><table class="table table-sm table-bordered align-middle">');
+    html.push('<thead><tr><th>特徴</th><th>平均（fav）</th><th>平均（non）</th><th>差</th><th>d</th><th>n</th></tr></thead><tbody>');
+    for (const r of top) {
+      html.push(`<tr>
+        <td class="text-nowrap">${escapeHtml(r.feature)}</td>
+        <td>${r.mean_fav.toFixed(2)}</td>
+        <td>${r.mean_non.toFixed(2)}</td>
+        <td>${r.diff.toFixed(2)}</td>
+        <td>${(r.effect_d ?? 0).toFixed(2)}</td>
+        <td class="small text-secondary">${r.n_fav}/${r.n_non}</td>
+      </tr>`);
+    }
+    html.push('</tbody></table></div>');
+    container.innerHTML = html.join('\n');
+  }
+
+  function renderFavoritesTable(rows, unit) {
+    const cols = [
+      { key: 'createdAtRaw', title: 'createdAt' },
+      { key: 'type', title: 'type' },
+      { key: 'gender', title: 'gender' },
+      { key: 'ageRaw', title: 'age' },
+      { key: 'axisA', title: 'axisA' },
+      { key: 'axisB', title: 'axisB' },
+      { key: 'axisC', title: 'axisC' },
+      { key: 'axisD', title: 'axisD' },
+      { key: 'referred', title: 'referred', render: r => r.referred ? '1' : '0' },
+      { key: 'referrerId', title: 'referrer', render: r => {
+        if (!r.referrerId) return '';
+        return state.ui.maskPII ? maskId('r', r.referrerId) : escapeHtml(r.referrerId);
+      }},
+      { key: 'email', title: 'user', render: r => {
+        const key = r.emailLower || `row-${r._row}`;
+        return state.ui.maskPII ? maskId('u', key) : escapeHtml(r.email || key);
+      }},
+      { key: '_row', title: 'row' }
+    ];
+
+    state.dt.tableFavorites = destroyDT(state.dt.tableFavorites);
+    state.dt.tableFavorites = renderDataTable('tableFavorites', rows, cols);
+  }
+
+  // -----------------------------
+  // Rendering: Referral tab
+  // -----------------------------
+  function getRefFilter() {
+    return {
+      dateFrom: el('refDateFrom').value || null,
+      dateTo: el('refDateTo').value || null,
+      eventType: el('refEventType').value || 'all',
+      platform: el('refPlatform').value || 'all',
+      referrer: el('refReferrer').value || 'all'
+    };
+  }
+
+  function renderReferralTab() {
+    const filter = getRefFilter();
+    const rows = filterReferralEvents(state.derived.refEvents, filter);
+
+    // KPI
+    const share = rows.filter(e => e.eventType === 'share').length;
+    const visit = rows.filter(e => e.eventType === 'referral_visit').length;
+    const complete = rows.filter(e => e.eventType === 'referral_complete').length;
+
+    // uniques by id (visitors and completes)
+    const uniqVisitors = uniqueCount(rows.filter(e => e.eventType === 'referral_visit' && e.userId), e => e.userId);
+    const uniqCompletes = uniqueCount(rows.filter(e => e.eventType === 'referral_complete' && e.userId), e => e.userId);
+
+    const sv = share > 0 ? uniqVisitors / share : null;
+    const vc = uniqVisitors > 0 ? uniqCompletes / uniqVisitors : null;
+    const sc = share > 0 ? uniqCompletes / share : null;
+
+    // favorites among matched completes (email join)
+    const completeEmails = rows.filter(e => e.eventType === 'referral_complete' && e.userEmailLower).map(e => e.userEmailLower);
+    const uniqCompleteEmails = new Set(completeEmails);
+    let matched = 0;
+    let matchedFav = 0;
+    for (const emailLower of uniqCompleteEmails.values()) {
+      if (state.derived.diagnosisUserIndex.has(emailLower)) {
+        matched += 1;
+        if (state.derived.diagnosisUserIndex.get(emailLower).hasFavorite) matchedFav += 1;
+      }
+    }
+    const matchedFavRate = matched > 0 ? matchedFav / matched : null;
+
+    renderKpiCards('#refKpis', [
+      { label: 'share', value: String(share) },
+      { label: 'visit（unique）', value: String(uniqVisitors), sub: share > 0 ? `share→visit ${formatPct(sv)}` : '—' },
+      { label: 'complete（unique）', value: String(uniqCompletes), sub: uniqVisitors > 0 ? `visit→complete ${formatPct(vc)}` : '—' },
+      { label: 'complete→fav（診断マッチ）', value: `${matchedFav}/${matched}`, sub: matched > 0 ? formatPct(matchedFavRate) : '—' },
+    ]);
+
+    // Funnel chart (use totals from filtered rows)
+    plotFunnel('chartRefFunnel', ['share', 'visit (unique)', 'complete (unique)'], [share, uniqVisitors, uniqCompletes]);
+
+    // Trend chart: day counts within filter
+    const dailyMap = new Map();
+    for (const ev of rows) {
+      if (!ev.date) continue;
+      if (!dailyMap.has(ev.date)) dailyMap.set(ev.date, { date: ev.date, share: 0, visit: 0, complete: 0 });
+      const d = dailyMap.get(ev.date);
+      if (ev.eventType === 'share') d.share += 1;
+      if (ev.eventType === 'referral_visit') d.visit += 1;
+      if (ev.eventType === 'referral_complete') d.complete += 1;
+    }
+    const days = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+    if (days.length) {
+      plotLineMulti('chartRefTrend', [
+        { name: 'share', x: days.map(d => d.date), y: days.map(d => d.share) },
+        { name: 'visit', x: days.map(d => d.date), y: days.map(d => d.visit) },
+        { name: 'complete', x: days.map(d => d.date), y: days.map(d => d.complete) },
+      ], '');
+    } else plotEmpty('chartRefTrend', 'データがありません');
+
+    // Referrer leaderboard (computed on all events, then filtered? We'll compute on ALL but allow filter by date/platform/referrer? For simplicity: use filtered rows, but this can hide global context.)
+    renderReferrerLeaderboard(filter);
+
+    // Sankey
+    renderReferralSankey();
+
+    // Raw events table
+    renderReferralEventsTable(rows);
+
+    // Selected referrer details
+    renderSelectedReferrerDetails();
+  }
+
+  function renderReferrerLeaderboard(filter) {
+    // compute stats from refEvents filtered by date range only (ignore eventType/platform selection to keep stable)
+    const baseFilter = { ...filter, eventType: 'all', platform: 'all', referrer: 'all' };
+    const baseEvents = filterReferralEvents(state.derived.refEvents, baseFilter);
+
+    const stats = buildReferrerStats(baseEvents, state.derived.referrerMeta, state.derived.diagnosisUserIndex);
+
+    const cols = [
+      { key: 'referrerLabel', title: 'referrer', render: r => {
+        const label = state.ui.maskPII ? maskId('r', r.referrerId) : r.referrerLabel;
+        return escapeHtml(label);
+      }},
+      { key: 'shares', title: 'shares' },
+      { key: 'uniqueVisitors', title: 'visitors' },
+      { key: 'uniqueCompletes', title: 'completes' },
+      { key: 'visitToComplete', title: 'visit→complete', render: r => formatPct(r.visitToComplete ?? NaN) },
+      { key: 'avgTTC', title: 'avg h', render: r => Number.isFinite(r.avgTTC) ? r.avgTTC.toFixed(1) : '—' },
+      { key: 'matchedFavRate', title: 'fav rate', render: r => Number.isFinite(r.matchedFavRate) ? formatPct(r.matchedFavRate) : '—' },
+    ];
+
+    state.dt.tableReferrers = destroyDT(state.dt.tableReferrers);
+    state.dt.tableReferrers = renderDataTable('tableReferrers', stats, cols, (row) => {
+      state.selection.selectedReferrerId = row.referrerId;
+      // also update dropdown selection (so filters sync)
+      const sel = el('refReferrer');
+      if (sel) sel.value = row.referrerId;
+      renderSelectedReferrerDetails();
+      // open details
+      // (no forced open)
+    });
+  }
+
+  function renderReferralSankey() {
+    const mode = el('refSankeyMode').value || 'visits';
+    const minEdge = Number(el('refMinEdge').value || '1');
+
+    const edges = mode === 'completes' ? state.derived.edges.completes : state.derived.edges.visits;
+
+    const labelSource = (rid) => {
+      if (!rid) return 'referrer:unknown';
+      if (state.ui.maskPII) return `R:${maskId('r', rid)}`;
+      const meta = state.derived.referrerMeta.get(rid);
+      return meta?.userEmail || meta?.userName || rid;
+    };
+    const labelTarget = (uid) => {
+      if (!uid) return 'user:unknown';
+      if (state.ui.maskPII) return `U:${maskId('u', uid)}`;
+      const meta = state.derived.userMeta.get(uid);
+      return meta?.userEmail || meta?.userName || uid;
+    };
+
+    plotSankey('chartRefSankey', edges, labelSource, labelTarget, minEdge);
+
+    const shown = edges.filter(e => e.value >= minEdge).length;
+    setText('refSankeyHint', `表示エッジ: ${shown}（min edge=${minEdge}）`);
+  }
+
+  function renderReferralEventsTable(rows) {
+    const cols = [
+      { key: 'timestampRaw', title: 'timestamp' },
+      { key: 'eventType', title: 'eventType' },
+      { key: 'platform', title: 'platform', render: r => escapeHtml((r.platform ?? '')) },
+      { key: 'referrerId', title: 'referrer', render: r => {
+        const rid = (r.eventType === 'share') ? (r.userId || r.referrerId) : r.referrerId;
+        if (!rid) return '';
+        return state.ui.maskPII ? maskId('r', rid) : escapeHtml(rid);
+      }},
+      { key: 'userId', title: 'userId', render: r => {
+        if (!r.userId) return '';
+        return state.ui.maskPII ? maskId('u', r.userId) : escapeHtml(r.userId);
+      }},
+      { key: 'userEmail', title: 'userEmail', render: r => {
+        if (!r.userEmail) return '';
+        return state.ui.maskPII ? maskId('u', r.userEmailLower || r.userEmail) : escapeHtml(r.userEmail);
+      }},
+      { key: '_row', title: 'row' }
+    ];
+
+    state.dt.tableRefEvents = destroyDT(state.dt.tableRefEvents);
+    state.dt.tableRefEvents = renderDataTable('tableRefEvents', rows, cols);
+  }
+
+  function renderSelectedReferrerDetails() {
+    const rid = state.selection.selectedReferrerId || el('refReferrer').value;
+    if (!rid || rid === 'all') {
+      el('refSelectedSummary').innerHTML = '<span class="text-secondary">紹介者を選択してください。</span>';
+      plotEmpty('chartRefTTC', '紹介者を選択してください');
+      state.dt.tableRefEdges = destroyDT(state.dt.tableRefEdges);
+      el('tableRefEdges').innerHTML = '';
+      return;
+    }
+
+    // build details from all events (respect date filter range but not eventType/platform)
+    const filter = getRefFilter();
+    const baseFilter = { ...filter, eventType: 'all', platform: 'all', referrer: rid };
+    const evs = filterReferralEvents(state.derived.refEvents, baseFilter);
+
+    const shares = evs.filter(e => e.eventType === 'share').length;
+    const visits = evs.filter(e => e.eventType === 'referral_visit').map(e => e.userId).filter(Boolean);
+    const completes = evs.filter(e => e.eventType === 'referral_complete').map(e => e.userId).filter(Boolean);
+    const uniqV = new Set(visits).size;
+    const uniqC = new Set(completes).size;
+
+    // time-to-complete distribution
+    const ttc = [];
+    // compute per userId: first visit and first complete
+    const firstVisit = new Map();
+    for (const e of evs) {
+      if (e.eventType !== 'referral_visit' || !e.userId) continue;
+      const t = e.ts?.getTime() ?? null;
+      if (t === null) continue;
+      const prev = firstVisit.get(e.userId);
+      if (prev === undefined || t < prev) firstVisit.set(e.userId, t);
+    }
+    for (const e of evs) {
+      if (e.eventType !== 'referral_complete' || !e.userId) continue;
+      const t = e.ts?.getTime() ?? null;
+      const v = firstVisit.get(e.userId);
+      if (t === null || v === undefined || t < v) continue;
+      ttc.push((t - v) / (1000 * 60 * 60));
+    }
+
+    // matched favorites among complete emails (unique)
+    const completeEmails = evs.filter(e => e.eventType === 'referral_complete' && e.userEmailLower).map(e => e.userEmailLower);
+    const uniqCompleteEmails = new Set(completeEmails);
+    let matched = 0;
+    let matchedFav = 0;
+    for (const emailLower of uniqCompleteEmails.values()) {
+      if (state.derived.diagnosisUserIndex.has(emailLower)) {
+        matched += 1;
+        if (state.derived.diagnosisUserIndex.get(emailLower).hasFavorite) matchedFav += 1;
+      }
+    }
+
+    const meta = state.derived.referrerMeta.get(rid);
+    const label = state.ui.maskPII ? maskId('r', rid) : (meta?.userEmail || meta?.userName || rid);
+
+    el('refSelectedSummary').innerHTML = `
+      <div class="small">
+        <div><span class="text-secondary">referrer:</span> <span class="fw-semibold">${escapeHtml(label)}</span></div>
+        <div class="mt-2">shares: <span class="fw-semibold">${shares}</span></div>
+        <div>visitors（unique userId）: <span class="fw-semibold">${uniqV}</span></div>
+        <div>completes（unique userId）: <span class="fw-semibold">${uniqC}</span></div>
+        <div class="mt-2">診断マッチ（complete email）: <span class="fw-semibold">${matched}</span> / fav: <span class="fw-semibold">${matchedFav}</span>（${matched ? formatPct(matchedFav / matched) : '—'}）</div>
+      </div>
+    `;
+
+    if (ttc.length) plotHistogram('chartRefTTC', ttc, '', 'hours');
+    else plotEmpty('chartRefTTC', 'time-to-complete がありません');
+
+    // edges table for this referrer (visits & completes)
+    const byUser = new Map();
+    for (const e of evs) {
+      if (!e.userId) continue;
+      if (!byUser.has(e.userId)) byUser.set(e.userId, { userId: e.userId, visits: 0, completes: 0, firstVisit: null, firstComplete: null, hours: null, email: null });
+      const o = byUser.get(e.userId);
+      const t = e.ts?.getTime() ?? null;
+
+      if (e.eventType === 'referral_visit') {
+        o.visits += 1;
+        if (t !== null) o.firstVisit = o.firstVisit === null ? t : Math.min(o.firstVisit, t);
+      } else if (e.eventType === 'referral_complete') {
+        o.completes += 1;
+        if (t !== null) o.firstComplete = o.firstComplete === null ? t : Math.min(o.firstComplete, t);
+        if (e.userEmailLower) o.email = e.userEmailLower;
+      }
+    }
+
+    const edgeRows = [];
+    for (const o of byUser.values()) {
+      if (o.firstVisit !== null && o.firstComplete !== null && o.firstComplete >= o.firstVisit) {
+        o.hours = (o.firstComplete - o.firstVisit) / (1000 * 60 * 60);
+      }
+      edgeRows.push(o);
+    }
+    edgeRows.sort((a, b) => (b.completes - a.completes) || (b.visits - a.visits));
+
+    const cols = [
+      { key: 'userId', title: 'user', render: r => state.ui.maskPII ? maskId('u', r.userId) : escapeHtml(r.userId) },
+      { key: 'visits', title: 'visits' },
+      { key: 'completes', title: 'completes' },
+      { key: 'hours', title: 'hours', render: r => Number.isFinite(r.hours) ? r.hours.toFixed(2) : '—' },
+      { key: 'email', title: 'diag match', render: r => {
+        if (!r.email) return '';
+        const ok = state.derived.diagnosisUserIndex.has(r.email);
+        const fav = ok && state.derived.diagnosisUserIndex.get(r.email).hasFavorite;
+        const label2 = state.ui.maskPII ? maskId('u', r.email) : r.email;
+        return `${escapeHtml(label2)} ${ok ? (fav ? '★' : '✓') : ''}`;
+      }}
+    ];
+
+    state.dt.tableRefEdges = destroyDT(state.dt.tableRefEdges);
+    state.dt.tableRefEdges = renderDataTable('tableRefEdges', edgeRows, cols);
+  }
+
+  // -----------------------------
+  // UI: populate options
+  // -----------------------------
+  function populateTypeOptions(selectId, types) {
+    const sel = el(selectId);
+    if (!sel) return;
+    const current = sel.value || 'all';
+    sel.innerHTML = '<option value="all">すべて</option>';
+    for (const t of types) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      sel.appendChild(opt);
+    }
+    sel.value = types.includes(current) ? current : 'all';
+  }
+
+  function populatePlatformOptions(platforms) {
+    const sel = el('refPlatform');
+    if (!sel) return;
+    const current = sel.value || 'all';
+    sel.innerHTML = '<option value="all">すべて</option>';
+    for (const p of platforms) {
+      const opt = document.createElement('option');
+      opt.value = p;
+      opt.textContent = p;
+      sel.appendChild(opt);
+    }
+    sel.value = platforms.includes(current) ? current : 'all';
+  }
+
+  function populateReferrerOptions() {
+    const ids = Array.from(state.derived.referrerMeta.keys()).sort();
+    // If meta is missing, also include from edges
+    for (const e of state.derived.edges.visits) ids.push(e.referrerId);
+    for (const e of state.derived.edges.completes) ids.push(e.referrerId);
+
+    const uniq = Array.from(new Set(ids)).sort();
+
+    const renderLabel = (rid) => {
+      const meta = state.derived.referrerMeta.get(rid);
+      if (state.ui.maskPII) return maskId('r', rid);
+      return meta?.userEmail || meta?.userName || rid;
+    };
+
+    const selRef = el('refReferrer');
+    const selFav = el('favReferrer');
+    if (selRef) {
+      const current = selRef.value || 'all';
+      selRef.innerHTML = '<option value="all">すべて</option>';
+      for (const rid of uniq) {
+        const opt = document.createElement('option');
+        opt.value = rid;
+        opt.textContent = renderLabel(rid);
+        selRef.appendChild(opt);
+      }
+      if (current !== 'all' && uniq.includes(current)) selRef.value = current;
+      else selRef.value = 'all';
+    }
+    if (selFav) {
+      const current = selFav.value || 'all';
+      selFav.innerHTML = '<option value="all">すべて</option>';
+      for (const rid of uniq) {
+        const opt = document.createElement('option');
+        opt.value = rid;
+        opt.textContent = renderLabel(rid);
+        selFav.appendChild(opt);
+      }
+      if (current !== 'all' && uniq.includes(current)) selFav.value = current;
+      else selFav.value = 'all';
+    }
+  }
+
+  function setDefaultDateFilters() {
+    // diagnosis
+    const diagDates = state.norm.diagnosis.map(r => r.createdDate).filter(Boolean).sort();
+    const refDates = state.derived.refEvents.map(r => r.date).filter(Boolean).sort();
+
+    if (diagDates.length) {
+      el('diagDateFrom').value = diagDates[0];
+      el('diagDateTo').value = diagDates[diagDates.length - 1];
+      el('favDateFrom').value = diagDates[0];
+      el('favDateTo').value = diagDates[diagDates.length - 1];
+    }
+    if (refDates.length) {
+      el('refDateFrom').value = refDates[0];
+      el('refDateTo').value = refDates[refDates.length - 1];
+    }
+  }
+
+  // -----------------------------
+  // Load workbook
+  // -----------------------------
+  async function loadWorkbookFromFile(file) {
+    state.file = file;
+    setText('fileName', file?.name ?? '—');
+    setText('loadStatus', '読み込み中…');
+
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+
+    const diagSheetName = (wb.SheetNames || []).find(n => (n || '').toString().toLowerCase() === 'diagnosis');
+    const refSheetName = (wb.SheetNames || []).find(n => (n || '').toString().toLowerCase() === 'referral_events');
+
+    if (!diagSheetName || !refSheetName) {
+      setText('loadStatus', '必要なシートが見つかりません');
+      alert('このファイルには diagnosis と referral_events シートが必要です。');
+      return;
+    }
+
+    state.raw.diagnosis = sheetToRows(wb, diagSheetName);
+    state.raw.referral_events = sheetToRows(wb, refSheetName);
+
+    state.norm.diagnosis = normalizeDiagnosis(state.raw.diagnosis);
+    state.norm.referral_events = normalizeReferralEvents(state.raw.referral_events);
+
+    // derived
+    state.derived.diagnosisUsers = buildDiagnosisUsers(state.norm.diagnosis);
+    state.derived.diagnosisUserIndex = new Map();
+    for (const u of state.derived.diagnosisUsers) {
+      if (u.emailLower) state.derived.diagnosisUserIndex.set(u.emailLower, u);
+    }
+
+    state.derived.refEvents = state.norm.referral_events;
+    const refD = buildReferralDerived(state.derived.refEvents);
+    state.derived.refDaily = refD.refDaily;
+    state.derived.referrerMeta = refD.referrerMeta;
+    state.derived.userMeta = refD.userMeta;
+    state.derived.edges.visits = refD.edgesVisits;
+    state.derived.edges.completes = refD.edgesCompletes;
+    state.derived.journey = refD.journey;
+
+    state.derived.completeEmailToReferrer = buildCompleteEmailMap(state.derived.refEvents);
+
+    // enrich diagnosis with referral mapping
+    enrichDiagnosisWithReferral(state.norm.diagnosis, state.derived.completeEmailToReferrer);
+
+    // refresh users (because latestRecord got referral fields updated)
+    state.derived.diagnosisUsers = buildDiagnosisUsers(state.norm.diagnosis);
+    state.derived.diagnosisUserIndex = new Map();
+    for (const u of state.derived.diagnosisUsers) {
+      if (u.emailLower) state.derived.diagnosisUserIndex.set(u.emailLower, u);
+    }
+
+    // UI options
+    const types = Array.from(new Set(state.norm.diagnosis.map(r => normalizeType(r.type)))).sort();
+    populateTypeOptions('diagType', types);
+    populateTypeOptions('favType', types);
+
+    const platforms = Array.from(new Set(state.derived.refEvents.filter(e => e.eventType === 'share').map(e => (e.platform ?? 'unknown').toString()))).sort();
+    populatePlatformOptions(platforms);
+
+    populateReferrerOptions();
+
+    setDefaultDateFilters();
+
+    // Counts
+    setText('diagCount', String(state.norm.diagnosis.length));
+    setText('favCount', String(state.norm.diagnosis.filter(r => r.interested).length));
+    setText('refCount', String(state.derived.refEvents.length));
+
+    setText('loadStatus', '完了');
+
+    hide('noDataHint');
+
+    // render
+    renderAll();
+  }
+
+  function renderAll() {
+    renderDashboard();
+    renderDiagnosisTab();
+    renderFavoritesTab();
+    renderReferralTab();
+  }
+
+  // -----------------------------
+  // Export buttons
+  // -----------------------------
+  function setupExportButtons() {
+    el('btnExportDiagCSV').addEventListener('click', () => {
+      const unit = el('diagUnit').value || 'record';
+      const rows = filterDiagnosisRecords(state.norm.diagnosis, getDiagFilter(), unit);
+      const out = rows.map(r => ({
+        createdAt: r.createdAtRaw,
+        type: r.type,
+        gender: r.gender,
+        age: r.ageRaw,
+        axisA: r.axisA, axisB: r.axisB, axisC: r.axisC, axisD: r.axisD,
+        favorite: r.interested ? 1 : 0,
+        referred: r.referred ? 1 : 0,
+        referrerId: r.referrerId,
+        email: state.ui.maskPII ? maskId('u', r.emailLower || r.email || `row-${r._row}`) : r.email
+      }));
+      downloadText('diagnosis_filtered.csv', toCSV(out));
+    });
+
+    el('btnExportDiagJSON').addEventListener('click', () => {
+      const unit = el('diagUnit').value || 'record';
+      const rows = filterDiagnosisRecords(state.norm.diagnosis, getDiagFilter(), unit);
+      const out = rows.map(r => ({
+        createdAt: r.createdAtRaw,
+        type: r.type,
+        gender: r.gender,
+        age: r.ageRaw,
+        axes: { axisA: r.axisA, axisB: r.axisB, axisC: r.axisC, axisD: r.axisD },
+        favorite: r.interested ? 1 : 0,
+        referred: r.referred ? 1 : 0,
+        referrerId: r.referrerId,
+        user: state.ui.maskPII ? maskId('u', r.emailLower || r.email || `row-${r._row}`) : (r.email || null),
+        answers: r.answers
+      }));
+      downloadText('diagnosis_filtered.json', JSON.stringify(out, null, 2), 'application/json;charset=utf-8');
+    });
+
+    el('btnExportFavCSV').addEventListener('click', () => {
+      const unit = el('favUnit').value || 'user';
+      const rows = filterFavorites(state.norm.diagnosis, state.derived.diagnosisUsers, getFavFilter(), unit);
+      const out = rows.map(r => ({
+        createdAt: r.createdAtRaw,
+        type: r.type,
+        gender: r.gender,
+        age: r.ageRaw,
+        axisA: r.axisA, axisB: r.axisB, axisC: r.axisC, axisD: r.axisD,
+        referred: r.referred ? 1 : 0,
+        referrerId: r.referrerId,
+        user: state.ui.maskPII ? maskId('u', r.emailLower || r.email || `row-${r._row}`) : (r.email || null)
+      }));
+      downloadText('favorites_filtered.csv', toCSV(out));
+    });
+
+    el('btnExportFavJSON').addEventListener('click', () => {
+      const unit = el('favUnit').value || 'user';
+      const rows = filterFavorites(state.norm.diagnosis, state.derived.diagnosisUsers, getFavFilter(), unit);
+      const out = rows.map(r => ({
+        createdAt: r.createdAtRaw,
+        type: r.type,
+        gender: r.gender,
+        age: r.ageRaw,
+        axes: { axisA: r.axisA, axisB: r.axisB, axisC: r.axisC, axisD: r.axisD },
+        referred: r.referred ? 1 : 0,
+        referrerId: r.referrerId,
+        user: state.ui.maskPII ? maskId('u', r.emailLower || r.email || `row-${r._row}`) : (r.email || null),
+        answers: r.answers
+      }));
+      downloadText('favorites_filtered.json', JSON.stringify(out, null, 2), 'application/json;charset=utf-8');
+    });
+
+    el('btnExportRefCSV').addEventListener('click', () => {
+      const rows = filterReferralEvents(state.derived.refEvents, getRefFilter());
+      const out = rows.map(e => ({
+        timestamp: e.timestampRaw,
+        eventType: e.eventType,
+        platform: e.platform,
+        referrerId: e.eventType === 'share' ? (e.userId || e.referrerId) : e.referrerId,
+        userId: e.userId,
+        userEmail: state.ui.maskPII ? (e.userEmailLower ? maskId('u', e.userEmailLower) : '') : (e.userEmail || '')
+      }));
+      downloadText('referral_events_filtered.csv', toCSV(out));
+    });
+
+    el('btnExportRefJSON').addEventListener('click', () => {
+      const rows = filterReferralEvents(state.derived.refEvents, getRefFilter());
+      const out = rows.map(e => ({
+        timestamp: e.timestampRaw,
+        eventType: e.eventType,
+        platform: e.platform,
+        referrerId: e.eventType === 'share' ? (e.userId || e.referrerId) : e.referrerId,
+        userId: e.userId,
+        user: state.ui.maskPII ? (e.userEmailLower ? maskId('u', e.userEmailLower) : (e.userId ? maskId('u', e.userId) : null)) : (e.userEmail || e.userId),
+        payload: e.payload
+      }));
+      downloadText('referral_events_filtered.json', JSON.stringify(out, null, 2), 'application/json;charset=utf-8');
+    });
+  }
+
+  // -----------------------------
+  // Event wiring
+  // -----------------------------
+  function setupUI() {
+    // Drop zone / file input
+    const dz = el('dropZone');
+    const fi = el('fileInput');
+    const btn = el('btnPickFile');
+    const btnSample = el('btnLoadSample');
+
+    dz.addEventListener('click', () => fi.click());
+    btn.addEventListener('click', (e) => { e.stopPropagation(); fi.click(); });
+    btnSample.addEventListener('click', (e) => { e.stopPropagation(); alert('サンプルは同梱していません。'); });
+
+    dz.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dz.classList.add('dragover');
+    });
+    dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+    dz.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('dragover');
+      const file = e.dataTransfer.files?.[0];
+      if (file) loadWorkbookFromFile(file).catch(err => {
+        console.error(err);
+        alert('読み込みに失敗しました（コンソールを確認してください）。');
+      });
+    });
+
+    fi.addEventListener('change', () => {
+      const file = fi.files?.[0];
+      if (file) loadWorkbookFromFile(file).catch(err => {
+        console.error(err);
+        alert('読み込みに失敗しました（コンソールを確認してください）。');
+      });
+    });
+
+    // toggles
+    el('toggleMaskPII').addEventListener('change', () => {
+      state.ui.maskPII = el('toggleMaskPII').checked;
+      populateReferrerOptions();
+      renderAll();
+    });
+    el('toggleHideUnnamed').addEventListener('change', () => {
+      state.ui.hideUnnamed = el('toggleHideUnnamed').checked;
+      renderDashboard();
+    });
+
+    // filters: diagnosis
+    const diagInputs = ['diagDateFrom', 'diagDateTo', 'diagGender', 'diagType', 'diagAgeMin', 'diagAgeMax', 'diagReferral', 'diagUnit', 'diagAxisPick', 'diagAxisView'];
+    diagInputs.forEach(id => el(id).addEventListener('change', () => renderDiagnosisTab()));
+    ['diagAgeMin','diagAgeMax'].forEach(id => el(id).addEventListener('input', () => renderDiagnosisTab()));
+
+    // favorites
+    const favInputs = ['favDateFrom','favDateTo','favGender','favType','favAgeMin','favAgeMax','favReferrer','favUnit'];
+    favInputs.forEach(id => el(id).addEventListener('change', () => renderFavoritesTab()));
+    ['favAgeMin','favAgeMax'].forEach(id => el(id).addEventListener('input', () => renderFavoritesTab()));
+
+    // referral
+    const refInputs = ['refDateFrom','refDateTo','refEventType','refPlatform','refReferrer','refSankeyMode','refMinEdge'];
+    refInputs.forEach(id => el(id).addEventListener('change', () => renderReferralTab()));
+    el('refMinEdge').addEventListener('input', () => renderReferralTab());
+
+    // scroll top
+    const topBtn = el('btnScrollTop');
+    window.addEventListener('scroll', () => {
+      if (window.scrollY > 600) topBtn.style.display = 'block';
+      else topBtn.style.display = 'none';
+    });
+    topBtn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+    // export
+    setupExportButtons();
+  }
+
+  // -----------------------------
+  // Bootstrap
+  // -----------------------------
+  document.addEventListener('DOMContentLoaded', () => {
+    setupUI();
+  });
+
+})();

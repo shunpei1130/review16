@@ -1,0 +1,64 @@
+
+:root{
+  --app-max: 1100px;
+}
+
+.app-max{
+  max-width: var(--app-max);
+}
+
+.app-header{
+  background: #ffffff;
+}
+
+.drop-zone{
+  border: 2px dashed rgba(0,0,0,.15);
+  border-radius: 12px;
+  padding: 14px 14px;
+  background: rgba(13,110,253,.03);
+  cursor: pointer;
+  user-select: none;
+}
+
+.drop-zone.dragover{
+  border-color: rgba(13,110,253,.55);
+  background: rgba(13,110,253,.06);
+}
+
+.sticky-tabs{
+  position: sticky;
+  top: 0;
+  background: #ffffff;
+  z-index: 20;
+  padding-top: 8px;
+}
+
+.summary-toggle{
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.plot{
+  width: 100%;
+  min-height: 280px;
+}
+
+.plot-tall{
+  min-height: 360px;
+}
+
+.scroll-top{
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  display: none;
+  z-index: 50;
+}
+
+/* make DataTables UI slightly quieter */
+div.dt-container .dt-paging .dt-paging-button{
+  padding: .25rem .5rem;
+}
+div.dt-container .dt-search input{
+  width: 220px;
+}
